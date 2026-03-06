@@ -1,0 +1,1399 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta property="og:title" content="HPC-Relay -- AI on Your HPC, From Your Phone">
+  <meta property="og:description"
+    content="Control AI coding agents on HPC clusters via Telegram. Transfer files, switch models, manage sessions. No VPN needed.">
+  <meta property="og:type" content="website">
+  <meta name="twitter:card" content="summary_large_image">
+  <title>HPC-Relay -- AI on Your HPC, From Your Phone</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link
+    href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@400;500;600;700;800&display=swap"
+    rel="stylesheet">
+  <style>
+    :root {
+      --bg: #050a0f;
+      --surface: #0a1520;
+      --surface2: #0f1e2e;
+      --border: #1a3248;
+      --accent: #00d4ff;
+      --accent2: #7c3aed;
+      --accent3: #10b981;
+      --text: #e2f0ff;
+      --muted: #6b8aaa;
+      --mono: 'JetBrains Mono', monospace;
+      --sans: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+    }
+
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    html {
+      scroll-behavior: smooth;
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--sans);
+      overflow-x: hidden;
+    }
+
+    body::before {
+      content: '';
+      position: fixed;
+      inset: 0;
+      background-image:
+        linear-gradient(rgba(0, 212, 255, 0.03) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(0, 212, 255, 0.03) 1px, transparent 1px);
+      background-size: 60px 60px;
+      z-index: 0;
+      pointer-events: none;
+    }
+
+    .orb {
+      position: fixed;
+      border-radius: 50%;
+      filter: blur(120px);
+      opacity: 0.12;
+      pointer-events: none;
+      z-index: 0;
+      animation: drift 20s ease-in-out infinite alternate;
+    }
+
+    .orb-1 {
+      width: 600px;
+      height: 600px;
+      background: var(--accent);
+      top: -200px;
+      left: -100px;
+      animation-delay: 0s;
+    }
+
+    .orb-2 {
+      width: 500px;
+      height: 500px;
+      background: var(--accent2);
+      bottom: -100px;
+      right: -100px;
+      animation-delay: -7s;
+    }
+
+    .orb-3 {
+      width: 400px;
+      height: 400px;
+      background: var(--accent3);
+      top: 40%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      animation-delay: -14s;
+    }
+
+    @keyframes drift {
+      0% {
+        transform: translate(0, 0) scale(1);
+      }
+
+      100% {
+        transform: translate(40px, 30px) scale(1.1);
+      }
+    }
+
+    .container {
+      max-width: 900px;
+      margin: 0 auto;
+      padding: 0 24px;
+      position: relative;
+      z-index: 1;
+    }
+
+    /* NAV */
+    nav {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      z-index: 100;
+      background: rgba(5, 10, 15, 0.85);
+      backdrop-filter: blur(20px);
+      border-bottom: 1px solid var(--border);
+      padding: 0 24px;
+    }
+
+    nav .inner {
+      max-width: 900px;
+      margin: 0 auto;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      height: 60px;
+    }
+
+    .nav-logo {
+      font-family: var(--mono);
+      font-size: 14px;
+      color: var(--accent);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .nav-logo .dot {
+      width: 8px;
+      height: 8px;
+      background: var(--accent3);
+      border-radius: 50%;
+      animation: pulse 2s ease-in-out infinite;
+    }
+
+    @keyframes pulse {
+
+      0%,
+      100% {
+        opacity: 1;
+        transform: scale(1);
+      }
+
+      50% {
+        opacity: 0.5;
+        transform: scale(1.5);
+      }
+    }
+
+    .nav-links {
+      display: flex;
+      gap: 28px;
+    }
+
+    .nav-links a {
+      color: var(--muted);
+      text-decoration: none;
+      font-size: 13px;
+      font-weight: 600;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      transition: color 0.2s;
+    }
+
+    .nav-links a:hover {
+      color: var(--accent);
+    }
+
+    /* HERO */
+    .hero {
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 100px 24px 60px;
+      text-align: center;
+    }
+
+    .hero-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      background: rgba(0, 212, 255, 0.08);
+      border: 1px solid rgba(0, 212, 255, 0.2);
+      border-radius: 100px;
+      padding: 6px 16px;
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--accent);
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      margin-bottom: 32px;
+      animation: fadeSlideUp 0.8s ease forwards;
+    }
+
+    .hero h1 {
+      font-size: clamp(36px, 6vw, 72px);
+      font-weight: 800;
+      line-height: 0.95;
+      letter-spacing: -0.03em;
+      margin-bottom: 28px;
+      animation: fadeSlideUp 0.8s ease 0.1s both;
+    }
+
+    .hero h1 .line-1 {
+      display: block;
+      color: var(--text);
+    }
+
+    .hero h1 .line-2 {
+      display: block;
+      background: linear-gradient(90deg, var(--accent), var(--accent2), var(--accent3));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+      background-size: 200% auto;
+      animation: shimmer 4s linear infinite, fadeSlideUp 0.8s ease 0.1s both;
+    }
+
+    @keyframes shimmer {
+      to {
+        background-position: 200% center;
+      }
+    }
+
+    .hero-sub {
+      font-size: 16px;
+      color: var(--muted);
+      line-height: 1.7;
+      max-width: 560px;
+      margin: 0 auto 36px;
+      animation: fadeSlideUp 0.8s ease 0.2s both;
+    }
+
+    .hero-actions {
+      display: flex;
+      gap: 16px;
+      justify-content: center;
+      flex-wrap: wrap;
+      animation: fadeSlideUp 0.8s ease 0.3s both;
+    }
+
+    .btn-primary {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      background: var(--accent);
+      color: var(--bg);
+      padding: 14px 28px;
+      border-radius: 8px;
+      font-family: var(--sans);
+      font-weight: 700;
+      font-size: 15px;
+      text-decoration: none;
+      transition: all 0.2s;
+      box-shadow: 0 0 40px rgba(0, 212, 255, 0.3);
+    }
+
+    .btn-primary:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 0 60px rgba(0, 212, 255, 0.5);
+    }
+
+    .btn-secondary {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      background: transparent;
+      color: var(--text);
+      border: 1px solid var(--border);
+      padding: 14px 28px;
+      border-radius: 8px;
+      font-family: var(--sans);
+      font-weight: 700;
+      font-size: 15px;
+      text-decoration: none;
+      transition: all 0.2s;
+    }
+
+    .btn-secondary:hover {
+      border-color: var(--accent);
+      color: var(--accent);
+      transform: translateY(-2px);
+    }
+
+    /* PIPELINE */
+    .pipeline-section {
+      padding: 60px 0;
+    }
+
+    .pipeline-section h2 {
+      text-align: center;
+      font-size: 30px;
+      font-weight: 800;
+      margin-bottom: 12px;
+    }
+
+    .pipeline-section .sub {
+      text-align: center;
+      color: var(--muted);
+      margin-bottom: 48px;
+      font-size: 15px;
+    }
+
+    .pipeline {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 0;
+      flex-wrap: wrap;
+    }
+
+    .pipeline-node {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 20px 24px;
+      text-align: center;
+      min-width: 130px;
+      position: relative;
+      transition: all 0.3s;
+    }
+
+    .pipeline-node:hover {
+      border-color: var(--accent);
+      transform: translateY(-4px);
+      box-shadow: 0 8px 40px rgba(0, 212, 255, 0.15);
+    }
+
+    .pipeline-node .icon {
+      font-size: 28px;
+      margin-bottom: 8px;
+    }
+
+    .pipeline-node .label {
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+
+    .pipeline-node .name {
+      font-size: 14px;
+      font-weight: 700;
+      margin-top: 4px;
+    }
+
+    .pipeline-arrow {
+      color: var(--accent);
+      font-size: 24px;
+      padding: 0 8px;
+      display: flex;
+      align-items: center;
+      opacity: 0.6;
+    }
+
+    .pipeline-arrow.encrypted {
+      position: relative;
+    }
+
+    .pipeline-arrow.encrypted::after {
+      content: 'SSH';
+      position: absolute;
+      top: -18px;
+      left: 50%;
+      transform: translateX(-50%);
+      font-family: var(--mono);
+      font-size: 9px;
+      color: var(--accent3);
+      background: rgba(16, 185, 129, 0.1);
+      border: 1px solid rgba(16, 185, 129, 0.3);
+      padding: 2px 6px;
+      border-radius: 4px;
+      white-space: nowrap;
+    }
+
+    /* GENERIC SECTION STYLES */
+    .section-label {
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--accent);
+      text-transform: uppercase;
+      letter-spacing: 0.15em;
+      text-align: center;
+      margin-bottom: 12px;
+    }
+
+    .section-title {
+      font-size: 30px;
+      font-weight: 800;
+      text-align: center;
+      margin-bottom: 12px;
+    }
+
+    .section-sub {
+      text-align: center;
+      color: var(--muted);
+      margin-bottom: 48px;
+      font-size: 15px;
+    }
+
+    /* FEATURES GRID */
+    .features-section {
+      padding: 60px 0;
+    }
+
+    .features-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 16px;
+    }
+
+    .feature-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 22px;
+      transition: all 0.3s;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .feature-card::before {
+      content: '';
+      position: absolute;
+      inset: 0;
+      background: linear-gradient(135deg, rgba(0, 212, 255, 0.04) 0%, transparent 60%);
+      opacity: 0;
+      transition: opacity 0.3s;
+    }
+
+    .feature-card:hover {
+      border-color: var(--accent);
+      transform: translateY(-4px);
+    }
+
+    .feature-card:hover::before {
+      opacity: 1;
+    }
+
+    .feature-icon {
+      width: 44px;
+      height: 44px;
+      border-radius: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 20px;
+      margin-bottom: 16px;
+    }
+
+    .feature-card h3 {
+      font-size: 17px;
+      font-weight: 700;
+      margin-bottom: 8px;
+    }
+
+    .feature-card p {
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.6;
+    }
+
+    .tag {
+      display: inline-block;
+      margin-top: 12px;
+      font-family: var(--mono);
+      font-size: 10px;
+      background: rgba(0, 212, 255, 0.08);
+      border: 1px solid rgba(0, 212, 255, 0.2);
+      color: var(--accent);
+      padding: 3px 8px;
+      border-radius: 4px;
+      letter-spacing: 0.05em;
+    }
+
+    .tag.green {
+      background: rgba(16, 185, 129, 0.08);
+      border-color: rgba(16, 185, 129, 0.2);
+      color: var(--accent3);
+    }
+
+    .tag.purple {
+      background: rgba(124, 58, 237, 0.08);
+      border-color: rgba(124, 58, 237, 0.2);
+      color: #a78bfa;
+    }
+
+    /* COMMANDS SECTION */
+    .commands-section {
+      padding: 60px 0;
+    }
+
+    .cmd-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 14px;
+    }
+
+    .cmd-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 20px 24px;
+      transition: all 0.3s;
+    }
+
+    .cmd-card:hover {
+      border-color: var(--accent);
+      transform: translateY(-2px);
+    }
+
+    .cmd-card .cmd-label {
+      font-family: var(--mono);
+      font-size: 10px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      margin-bottom: 8px;
+    }
+
+    .cmd-card .cmd-syntax {
+      font-family: var(--mono);
+      font-size: 13px;
+      color: var(--accent3);
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      padding: 8px 12px;
+      border-radius: 6px;
+      margin-bottom: 8px;
+      word-break: break-all;
+    }
+
+    .cmd-card .cmd-desc {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.5;
+    }
+
+    /* MODELS SECTION */
+    .models-section {
+      padding: 60px 0;
+    }
+
+    .models-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 14px;
+      margin-bottom: 24px;
+    }
+
+    .model-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 20px;
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      transition: all 0.3s;
+    }
+
+    .model-card:hover {
+      border-color: var(--accent);
+      transform: translateY(-2px);
+    }
+
+    .model-logo {
+      font-size: 28px;
+    }
+
+    .model-info .provider {
+      font-family: var(--mono);
+      font-size: 10px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+    }
+
+    .model-info .name {
+      font-size: 14px;
+      font-weight: 700;
+      margin-top: 2px;
+    }
+
+    .model-info .note {
+      font-size: 12px;
+      color: var(--accent3);
+      margin-top: 2px;
+    }
+
+    .model-note {
+      background: rgba(16, 185, 129, 0.06);
+      border: 1px solid rgba(16, 185, 129, 0.15);
+      border-radius: 10px;
+      padding: 16px 20px;
+      font-size: 14px;
+      color: var(--muted);
+      line-height: 1.6;
+      text-align: center;
+    }
+
+    .model-note strong {
+      color: var(--accent3);
+    }
+
+    /* WORKFLOW STEPS */
+    .workflow-section {
+      padding: 60px 0;
+    }
+
+    .steps {
+      display: flex;
+      flex-direction: column;
+      gap: 0;
+      max-width: 640px;
+      margin: 0 auto;
+    }
+
+    .step {
+      display: flex;
+      gap: 24px;
+      position: relative;
+      padding-bottom: 40px;
+    }
+
+    .step:last-child {
+      padding-bottom: 0;
+    }
+
+    .step-line {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+
+    .step-num {
+      width: 40px;
+      height: 40px;
+      border-radius: 50%;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-family: var(--mono);
+      font-size: 13px;
+      font-weight: 700;
+      color: var(--accent);
+      flex-shrink: 0;
+      z-index: 1;
+    }
+
+    .step-connector {
+      width: 1px;
+      flex: 1;
+      background: var(--border);
+      margin-top: 8px;
+      min-height: 40px;
+    }
+
+    .step:last-child .step-connector {
+      display: none;
+    }
+
+    .step-body {
+      padding-top: 8px;
+    }
+
+    .step-body h3 {
+      font-size: 17px;
+      font-weight: 700;
+      margin-bottom: 6px;
+    }
+
+    .step-body p {
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.6;
+    }
+
+    .step-body code {
+      display: inline-block;
+      margin-top: 10px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      font-family: var(--mono);
+      font-size: 12px;
+      color: var(--accent3);
+      padding: 8px 14px;
+      border-radius: 6px;
+      width: 100%;
+      white-space: pre-wrap;
+    }
+
+    /* HPC BEST PRACTICES */
+    .hpc-section {
+      padding: 60px 0;
+    }
+
+    .hpc-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 20px;
+    }
+
+    .hpc-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 24px;
+      transition: all 0.3s;
+    }
+
+    .hpc-card.do {
+      border-left: 3px solid var(--accent3);
+    }
+
+    .hpc-card.dont {
+      border-left: 3px solid #ef4444;
+    }
+
+    .hpc-card h4 {
+      font-size: 14px;
+      font-weight: 700;
+      margin-bottom: 10px;
+    }
+
+    .hpc-card.do h4 {
+      color: var(--accent3);
+    }
+
+    .hpc-card.dont h4 {
+      color: #ef4444;
+    }
+
+    .hpc-card ul {
+      list-style: none;
+      padding: 0;
+    }
+
+    .hpc-card ul li {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.8;
+      padding-left: 16px;
+      position: relative;
+    }
+
+    .hpc-card.do ul li::before {
+      content: '\2713';
+      position: absolute;
+      left: 0;
+      color: var(--accent3);
+      font-weight: 700;
+    }
+
+    .hpc-card.dont ul li::before {
+      content: '\2717';
+      position: absolute;
+      left: 0;
+      color: #ef4444;
+      font-weight: 700;
+    }
+
+    /* BONUS + CHAT VIEWER */
+    .bonus-section {
+      padding: 60px 0;
+    }
+
+    .bonus-card {
+      background: linear-gradient(135deg, rgba(124, 58, 237, 0.08), rgba(0, 212, 255, 0.05));
+      border: 1px solid rgba(124, 58, 237, 0.25);
+      border-radius: 20px;
+      padding: 40px;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 40px;
+      align-items: center;
+    }
+
+    @media (max-width: 700px) {
+      .bonus-card {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    .bonus-card h3 {
+      font-size: 22px;
+      font-weight: 800;
+      margin-bottom: 10px;
+    }
+
+    .bonus-card p {
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.7;
+    }
+
+    .bonus-visual {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .flow-step {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 12px 16px;
+      font-family: var(--mono);
+      font-size: 12px;
+    }
+
+    .flow-step .ico {
+      font-size: 20px;
+    }
+
+    /* CTA */
+    .cta-section {
+      padding: 60px 0;
+      text-align: center;
+    }
+
+    .cta-box {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      padding: 44px 32px;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .cta-box::before {
+      content: '';
+      position: absolute;
+      inset: 0;
+      background: radial-gradient(ellipse at 50% 0%, rgba(0, 212, 255, 0.08), transparent 70%);
+    }
+
+    .cta-box h2 {
+      font-size: 30px;
+      font-weight: 800;
+      margin-bottom: 12px;
+      position: relative;
+      z-index: 1;
+    }
+
+    .cta-box p {
+      color: var(--muted);
+      font-size: 15px;
+      margin-bottom: 28px;
+      position: relative;
+      z-index: 1;
+    }
+
+    .cta-box .actions {
+      display: flex;
+      gap: 16px;
+      justify-content: center;
+      flex-wrap: wrap;
+      position: relative;
+      z-index: 1;
+    }
+
+    footer {
+      border-top: 1px solid var(--border);
+      padding: 40px 24px;
+      text-align: center;
+      font-family: var(--mono);
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    footer a {
+      color: var(--accent);
+      text-decoration: none;
+    }
+
+    @keyframes fadeSlideUp {
+      from {
+        opacity: 0;
+        transform: translateY(30px);
+      }
+
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
+
+    .reveal {
+      opacity: 0;
+      transform: translateY(24px);
+      transition: opacity 0.7s ease, transform 0.7s ease;
+    }
+
+    .reveal.visible {
+      opacity: 1;
+      transform: translateY(0);
+    }
+
+    @media (max-width: 600px) {
+      .pipeline {
+        flex-direction: column;
+      }
+
+      .pipeline-arrow {
+        transform: rotate(90deg);
+      }
+
+      .nav-links {
+        display: none;
+      }
+    }
+  </style>
+</head>
+
+<body>
+
+  <div class="orb orb-1"></div>
+  <div class="orb orb-2"></div>
+  <div class="orb orb-3"></div>
+
+  <nav>
+    <div class="inner">
+      <div class="nav-logo">
+        <div class="dot"></div>
+        hpc-relay
+      </div>
+      <div class="nav-links">
+        <a href="#features">Features</a>
+        <a href="#commands">Commands</a>
+        <a href="#models">Models</a>
+        <a href="#setup">Setup</a>
+        <a href="#hpc-practices">HPC Tips</a>
+        <a href="https://github.com/MichaelG0501/hpc-relay" target="_blank">GitHub</a>
+      </div>
+    </div>
+  </nav>
+
+  <!-- HERO -->
+  <section class="hero">
+    <div>
+      <div class="hero-badge">Open Source -- HPC Research Tool</div>
+      <h1>
+        <span class="line-1">Your HPC Cluster.</span>
+        <span class="line-2">From Your Phone.</span>
+      </h1>
+      <p class="hero-sub">
+        Control AI coding agents on HPC clusters via Telegram -- no VPN, no terminal, just your phone. Let AI help build
+        your scripts,
+        lauch jobs, debug and check results, simply send a message. Built for researchers and bioinformaticians.
+      </p>
+      <div class="hero-actions">
+        <a href="https://github.com/MichaelG0501/hpc-relay" class="btn-primary" target="_blank">
+          Star on GitHub
+        </a>
+        <a href="#setup" class="btn-secondary">
+          Quick Start
+        </a>
+      </div>
+    </div>
+  </section>
+
+  <!-- DEMO -->
+  <section class="demo-section" style="padding-bottom: 60px;">
+    <div class="container reveal">
+      <div
+        style="border: 1px solid var(--border); border-radius: 12px; padding: 4px; background: rgba(255, 255, 255, 0.02); display: flex; gap: 8px; justify-content: center; align-items: flex-start; overflow-x: auto;">
+        <img src="assets/Results1.png" alt="Results 1"
+          style="width: 19%; object-fit: contain; border-radius: 8px; box-shadow: 0 4px 20px rgba(0, 0, 0, 0.2);">
+        <img src="assets/Results2.png" alt="Results 2"
+          style="width: 19%; object-fit: contain; border-radius: 8px; box-shadow: 0 4px 20px rgba(0, 0, 0, 0.2);">
+        <img src="assets/Code1.png" alt="Code 1"
+          style="width: 19%; object-fit: contain; border-radius: 8px; box-shadow: 0 4px 20px rgba(0, 0, 0, 0.2);">
+        <img src="assets/Bash1.png" alt="Bash 1"
+          style="width: 19%; object-fit: contain; border-radius: 8px; box-shadow: 0 4px 20px rgba(0, 0, 0, 0.2);">
+        <img src="assets/Bash2.png" alt="Bash 2"
+          style="width: 19%; object-fit: contain; border-radius: 8px; box-shadow: 0 4px 20px rgba(0, 0, 0, 0.2);">
+      </div>
+      <p style="text-align: center; color: var(--muted); font-size: 14px; margin-top: 16px;">
+        <em>A full video/GIF demo will be added here soon.</em>
+      </p>
+    </div>
+  </section>
+
+  <!-- PIPELINE DIAGRAM -->
+  <section class="pipeline-section">
+    <div class="container">
+      <h2 class="reveal">How It Works</h2>
+      <p class="sub reveal">One authenticated SSH tunnel. Infinite commands.</p>
+      <div class="pipeline reveal">
+        <div class="pipeline-node">
+          <div class="icon">&#x1F4F1;</div>
+          <div class="label">Input / Output</div>
+          <div class="name">Telegram</div>
+        </div>
+        <div class="pipeline-arrow">&harr;</div>
+        <div class="pipeline-node">
+          <div class="icon">&#x1F5A5;</div>
+          <div class="label">Relay</div>
+          <div class="name">Linux / WSL / Mac</div>
+        </div>
+        <div class="pipeline-arrow encrypted">&harr;</div>
+        <div class="pipeline-node">
+          <div class="icon">&#x1F3DB;</div>
+          <div class="label">Cluster</div>
+          <div class="name">HPC Login Node</div>
+        </div>
+        <div class="pipeline-arrow">&harr;</div>
+        <div class="pipeline-node">
+          <div class="icon">&#x1F916;</div>
+          <div class="label">Agent</div>
+          <div class="name">OpenCode / AI</div>
+        </div>
+        <div class="pipeline-arrow"
+          style="display: flex; flex-direction: column; align-items: center; justify-content: center; opacity: 0.8; gap: 4px; padding: 0 12px;">
+          <div style="font-size: 24px;">&rarr;</div>
+          <div
+            style="font-size: 10px; font-weight: bold; background: rgba(0,212,255,0.1); padding: 2px 6px; border-radius: 4px; border: 1px solid rgba(0,212,255,0.3); text-transform: uppercase; white-space: nowrap;">
+            Upload Drive</div>
+        </div>
+        <div class="pipeline-node">
+          <div class="icon">&#x2601;</div>
+          <div class="label">Results</div>
+          <div class="name">Google Drive</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- FEATURES -->
+  <section class="features-section" id="features">
+    <div class="container">
+      <div class="section-label reveal">Architecture</div>
+      <h2 class="section-title reveal">Built Different</h2>
+      <p class="section-sub reveal">No screen-scraping. No fragile hacks. A clean, deterministic pipeline.</p>
+      <div class="features-grid">
+
+        <div class="feature-card reveal">
+          <div class="feature-icon" style="background:rgba(124,58,237,0.1)">&#x1F4E1;</div>
+          <h3>No VPN Needed</h3>
+          <p>The relay runs on an already-authenticated machine. Your phone sends Telegram messages -- no Zscaler, no
+            battery drain, no dropped cellular connections.</p>
+          <span class="tag purple">Network Bypass</span>
+        </div>
+
+        <div class="feature-card reveal">
+          <div class="feature-icon" style="background:rgba(16,185,129,0.1)">&#x1F9E0;</div>
+          <h3>Stateful AI Sessions</h3>
+          <p>Session IDs are parsed and re-injected. The AI has full conversation memory from cold start -- no daemons,
+            no tmux processes idling on login nodes.</p>
+          <span class="tag green">sessionID Memory</span>
+        </div>
+
+        <div class="feature-card reveal">
+          <div class="feature-icon" style="background:rgba(16,185,129,0.1)">&#x1F4E6;</div>
+          <h3>File Transfers</h3>
+          <p>Download files from HPC to Telegram with <code
+              style="font-family:monospace;font-size:12px;color:var(--accent3)">@@send:path@@</code>. Upload from phone
+            with <code style="font-family:monospace;font-size:12px;color:var(--accent3)">@@upload:file@@</code>.
+            Supports wildcards for batch transfer.</p>
+          <span class="tag green">Send + Upload + Wildcards</span>
+        </div>
+
+        <div class="feature-card reveal">
+          <div class="feature-icon" style="background:rgba(124,58,237,0.1)">&#x1F50C;</div>
+          <h3>Agent-Agnostic</h3>
+          <p>Works with OpenCode, Claude Code, Aider, or any CLI AI tool with a <code
+              style="font-family:monospace;font-size:12px;color:var(--accent3)">--format json</code> flag. Same relay,
+            different agent.</p>
+          <span class="tag purple">Claude Code Compatible</span>
+        </div>
+
+        <div class="feature-card reveal">
+          <div class="feature-icon" style="background:rgba(16,185,129,0.1)">&#x1F4AC;</div>
+          <h3>Chat History Viewer</h3>
+          <p>Generate an interactive HTML page from all your AI conversations. Browse sessions, search messages, view
+            tool calls, track token usage.</p>
+          <span class="tag green">tools/chat_viewer.py</span>
+        </div>
+
+      </div>
+    </div>
+  </section>
+
+  <!-- COMMANDS -->
+  <section class="commands-section" id="commands">
+    <div class="container">
+      <div class="section-label reveal">Control</div>
+      <h2 class="section-title reveal">Commands Reference</h2>
+      <p class="section-sub reveal">Everything you can do from Telegram.</p>
+      <div class="cmd-grid">
+
+        <div class="cmd-card reveal">
+          <div class="cmd-label">AI Prompt</div>
+          <div class="cmd-syntax">just type naturally</div>
+          <div class="cmd-desc">Any message is sent as a prompt to the AI agent on HPC.</div>
+        </div>
+
+        <div class="cmd-card reveal">
+          <div class="cmd-label">Shell Command</div>
+          <div class="cmd-syntax">!ls -la ~/results/</div>
+          <div class="cmd-desc">Prefix with <strong>!</strong> to run raw shell commands directly on HPC.</div>
+        </div>
+
+        <div class="cmd-card reveal">
+          <div class="cmd-label">Switch Model</div>
+          <div class="cmd-syntax">@@model: opus46@@</div>
+          <div class="cmd-desc">Change AI model. Use alone (persistent) or inline with a prompt.</div>
+        </div>
+
+        <div class="cmd-card reveal">
+          <div class="cmd-label">Switch Session</div>
+          <div class="cmd-syntax">@@session: ses_abc123@@</div>
+          <div class="cmd-desc">Jump to a specific session for conversation context.</div>
+        </div>
+
+        <div class="cmd-card reveal">
+          <div class="cmd-label">Kill Process</div>
+          <div class="cmd-syntax">@@kill@@ or !kill</div>
+          <div class="cmd-desc">Terminate the currently running AI process immediately.</div>
+        </div>
+
+        <div class="cmd-card reveal">
+          <div class="cmd-label">Download File</div>
+          <div class="cmd-syntax">@@send:~/results/plot.png@@</div>
+          <div class="cmd-desc">Fetch a file from HPC and receive it in Telegram.</div>
+        </div>
+
+        <div class="cmd-card reveal">
+          <div class="cmd-label">Wildcard Fetch</div>
+          <div class="cmd-syntax">@@send:Auto*.png@@</div>
+          <div class="cmd-desc">Download all matching files. Supports glob patterns.</div>
+        </div>
+
+        <div class="cmd-card reveal">
+          <div class="cmd-label">Upload File</div>
+          <div class="cmd-syntax">@@upload:~/data/input.csv@@</div>
+          <div class="cmd-desc">Send a file from your phone to a path on HPC. Use as caption when sending a document.
+          </div>
+        </div>
+
+      </div>
+    </div>
+  </section>
+
+  <!-- MODELS -->
+  <section class="models-section" id="models">
+    <div class="container">
+      <div class="section-label reveal">Compatibility</div>
+      <h2 class="section-title reveal">Any Model. Any Provider.</h2>
+      <p class="section-sub reveal">30+ model aliases. Switch from Telegram with a single command.</p>
+      <div class="models-grid reveal">
+        <div class="model-card">
+          <div class="model-logo">&#x1F7E2;</div>
+          <div class="model-info">
+            <div class="provider">OpenAI</div>
+            <div class="name">GPT-4o / GPT-5 / Codex</div>
+            <div class="note">GitHub Copilot Pro</div>
+          </div>
+        </div>
+        <div class="model-card">
+          <div class="model-logo">&#x1F7E3;</div>
+          <div class="model-info">
+            <div class="provider">Anthropic</div>
+            <div class="name">Claude Opus 4.6 / Sonnet 4.6</div>
+            <div class="note">GitHub Copilot Pro</div>
+          </div>
+        </div>
+        <div class="model-card">
+          <div class="model-logo">&#x1F535;</div>
+          <div class="model-info">
+            <div class="provider">Google</div>
+            <div class="name">Gemini 2.5 / 3.1 Pro</div>
+            <div class="note">GitHub Copilot Pro</div>
+          </div>
+        </div>
+        <div class="model-card">
+          <div class="model-logo">&#x1F7E1;</div>
+          <div class="model-info">
+            <div class="provider">xAI / Local</div>
+            <div class="name">Grok Code Fast / Ollama</div>
+            <div class="note">Copilot Pro / Free</div>
+          </div>
+        </div>
+      </div>
+      <div class="model-note reveal">
+        <strong>University students:</strong> GitHub Copilot Pro (free with .edu email) gives you GPT-5.3-codex, Claude
+        Opus
+        4.6, Gemini 3.1 Pro, and more. Pair with this relay for frontier AI on your HPC -- <strong>completely
+          free</strong>.
+      </div>
+    </div>
+  </section>
+
+  <!-- SETUP STEPS -->
+  <section class="workflow-section" id="setup">
+    <div class="container">
+      <div class="section-label reveal">Getting Started</div>
+      <h2 class="section-title reveal">Quick Start</h2>
+      <p class="section-sub reveal">From zero to controlling your HPC from Telegram.</p>
+      <div class="steps">
+
+        <div class="step reveal">
+          <div class="step-line">
+            <div class="step-num">1</div>
+            <div class="step-connector"></div>
+          </div>
+          <div class="step-body">
+            <h3>Configure SSH Multiplexing</h3>
+            <p>Add ControlMaster config to <code style="font-family:monospace">~/.ssh/config</code> on your relay
+              machine. Authenticate once with MFA -- the socket persists automatically.</p>
+            <code>Host hpc&#10;  ControlMaster auto&#10;  ControlPath ~/.ssh/sockets/%r@%h:%p&#10;  ControlPersist 8h</code>
+          </div>
+        </div>
+
+        <div class="step reveal">
+          <div class="step-line">
+            <div class="step-num">2</div>
+            <div class="step-connector"></div>
+          </div>
+          <div class="step-body">
+            <h3>Create a Telegram Bot</h3>
+            <p>Message <strong>@BotFather</strong> for your bot token. Get your Chat ID from
+              <strong>@userinfobot</strong>.
+            </p>
+            <code>Token from @BotFather&#10;Chat ID from @userinfobot</code>
+          </div>
+        </div>
+
+        <div class="step reveal">
+          <div class="step-line">
+            <div class="step-num">3</div>
+            <div class="step-connector"></div>
+          </div>
+          <div class="step-body">
+            <h3>Clone, Configure, Run</h3>
+            <p>Clone the repo, copy <code style="font-family:monospace">.env.example</code> to <code
+                style="font-family:monospace">.env</code>, fill in your values — that's all the config you need.</p>
+            <code>git clone https://github.com/MichaelG0501/hpc-relay.git&#10;cd hpc-relay&#10;&#10;# Create a separate Python environment (recommended)&#10;# python3 -m venv hpcrelay && source hpcrelay/bin/activate&#10;&#10;pip install -r requirements.txt&#10;cp .env.example .env&#10;&#10;# Edit .env with your values&#10;python relay_bot.py</code>
+          </div>
+        </div>
+
+        <div class="step reveal">
+          <div class="step-line">
+            <div class="step-num">4</div>
+            <div class="step-connector"></div>
+          </div>
+          <div class="step-body">
+            <h3>Send Your First Command</h3>
+            <p>Open Telegram, message your bot. The AI executes on HPC and streams the response back -- formatted,
+              chunked, readable.</p>
+            <code>debug my RNA-seq pipeline in ~/analysis/pipeline.R</code>
+          </div>
+        </div>
+
+      </div>
+    </div>
+  </section>
+
+  <!-- HPC BEST PRACTICES -->
+  <section class="hpc-section" id="hpc-practices">
+    <div class="container">
+      <div class="section-label reveal">Institutional Compliance</div>
+      <h2 class="section-title reveal">HPC Best Practices</h2>
+      <p class="section-sub reveal">Stay compliant with your cluster's acceptable use policy.</p>
+      <div class="hpc-grid">
+        <div class="hpc-card do reveal">
+          <h4>Recommended</h4>
+          <ul>
+            <li>Use AI to generate SLURM job scripts</li>
+            <li>Submit jobs via <code style="font-family:monospace;font-size:12px;color:var(--accent3)">sbatch</code>
+            </li>
+            <li>Monitor with <code style="font-family:monospace;font-size:12px;color:var(--accent3)">squeue</code></li>
+            <li>Edit scripts, manage files</li>
+            <li>Lightweight rclone sync</li>
+            <li>Short AI agent queries</li>
+          </ul>
+        </div>
+        <div class="hpc-card dont reveal">
+          <h4>Avoid on Login Nodes</h4>
+          <ul>
+            <li>Running pipelines directly</li>
+            <li>Heavy computation or multi-core jobs</li>
+            <li>Large data processing</li>
+            <li>Long-running processes</li>
+            <li>Anything your HPC policy prohibits</li>
+          </ul>
+        </div>
+        <div class="hpc-card do reveal" style="grid-column: 1 / -1;">
+          <h4>Example Workflow</h4>
+          <ul>
+            <li>You: "Write a SLURM script for my Nextflow pipeline, 8 cores, 32GB, 4h"</li>
+            <li>AI generates the script and saves it</li>
+            <li>You: <code
+                style="font-family:monospace;font-size:12px;color:var(--accent3)">!sbatch ~/jobs/run_nf.sh</code></li>
+            <li>You: <code style="font-family:monospace;font-size:12px;color:var(--accent3)">!squeue -u $USER</code>
+            </li>
+            <li>You: <code
+                style="font-family:monospace;font-size:12px;color:var(--accent3)">@@send:~/results/output.pdf@@</code>
+            </li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- BONUS: RCLONE + CHAT VIEWER -->
+  <section class="bonus-section">
+    <div class="container">
+      <div class="bonus-card reveal" style="margin-bottom: 24px;">
+        <div>
+          <h3>Results in Google Drive. Instantly.</h3>
+          <p>
+            Couple the relay with <strong>rclone</strong> to sync pipeline outputs -- plots, PDFs, slides -- to Google
+            Drive. Open them on your phone seconds after the HPC finishes.
+          </p>
+        </div>
+        <div class="bonus-visual">
+          <div class="flow-step"><span class="ico">&#x1F916;</span> AI writes analysis, saves output/</div>
+          <div class="flow-step"><span class="ico">&#x1F504;</span> rclone syncs to Google Drive</div>
+          <div class="flow-step"><span class="ico">&#x1F4CA;</span> PDF / PNG / slides appear instantly</div>
+          <div class="flow-step"><span class="ico">&#x1F4F1;</span> View on phone, share with supervisor</div>
+        </div>
+      </div>
+      <div class="bonus-card reveal">
+        <div>
+          <h3>Chat History Viewer</h3>
+          <p>
+            Generate an interactive HTML visualization of all your AI conversations. Browse sessions, search messages,
+            inspect tool calls, and track token usage -- all in a dark-themed, responsive interface.
+          </p>
+        </div>
+        <div class="bonus-visual">
+          <div class="flow-step"><span class="ico">&#x1F4BE;</span> Run chat_viewer.py on HPC</div>
+          <div class="flow-step"><span class="ico">&#x1F310;</span> Generates interactive HTML page</div>
+          <div class="flow-step"><span class="ico">&#x1F50D;</span> Search, filter, browse sessions</div>
+          <div class="flow-step"><span class="ico">&#x1F4CB;</span> Track tokens, costs, tool calls</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- CTA -->
+  <section class="cta-section">
+    <div class="container">
+      <div class="cta-box reveal">
+        <h2>Ready to control your cluster?</h2>
+        <p>Clone the repo, edit your config, and send your first command from Telegram.</p>
+        <div class="actions">
+          <a href="https://github.com/MichaelG0501/hpc-relay" class="btn-primary" target="_blank">Star on GitHub</a>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    <p>Built for HPC researchers &middot; <a href="https://github.com/MichaelG0501/hpc-relay">GitHub</a> &middot; BSD-3
+      License</p>
+  </footer>
+
+  <script>
+    const observer = new IntersectionObserver((entries) => {
+      entries.forEach(e => {
+        if (e.isIntersecting) { e.target.classList.add('visible'); }
+      });
+    }, { threshold: 0.1 });
+    document.querySelectorAll('.reveal').forEach(el => observer.observe(el));
+  </script>
+</body>
+
+</html>
