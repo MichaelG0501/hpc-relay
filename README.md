@@ -70,9 +70,9 @@ You authenticate **once**. Everything else is automatic.
 |---|---|
 | **No VPN on phone** | Relay sits inside the authenticated network |
 | **AI session memory** | Parses & re-injects `sessionID` -- full context from cold start |
-| **File transfer** | Download files from the target machine to Telegram (`@@send:path@@`) |
-| **File upload** | Upload files from target to cloud (`@@upload:file@@`) |
-| **Wildcard fetch** | Send multiple files with glob patterns (e.g. `@@send:Auto*.png@@`) |
+| **File transfer** | Download files from the target machine to Telegram (`/send <path>`) |
+| **File upload** | Upload files from target to cloud (`/upload <path>`) |
+| **Wildcard fetch** | Send multiple files with glob patterns (e.g. `/send Auto*.png`) |
 | **Chat history viewer** | Generate interactive HTML viewer of all AI conversations |
 | **Agent-agnostic** | Works with OpenCode, Claude Code, Aider, or any headless CLI agent |
 
@@ -82,22 +82,28 @@ You authenticate **once**. Everything else is automatic.
 
 ### Talking to the AI Agent
 
+> Use slash commands only.
+
+
 Simply type a message. It gets forwarded to the AI agent on your target machine, for example:
 
 ```
 Generate an expression heatmap with random synthetic data.
 ```
 
-### Inline Directives
+### Slash Commands
 
 | Syntax | Action | Example |
 |---|---|---|
-| `@@model: <alias>@@` | Change the AI model for this message | `@@model: opus46@@ refactor my script` |
-| `@@session: <id>@@` | Switch to a specific AI session | `@@session: ses_abc123@@` / `@@session: new@@` |
-| `@@kill@@` or `!kill` | Kill the currently running AI process | `@@kill@@` |
-| `@@send: <path>@@` | Download a file from target machine to Telegram | `@@send: ~/results/plot.png@@` |
-| `@@send: Auto*.png@@` | Download matching files (wildcard) | `@@send: /project/Auto*.png@@` |
-| `@@upload: file@@` | Upload a file from target machine to cloud | `@@upload: ~/data/input.csv@@` |
+| `/model` | Open interactive provider -> model picker | `/model` |
+| `/new` | Start a fresh AI session | `/new` |
+| `/id <session_id>` | Switch to a specific session ID | `/id ses_abc123...` |
+| `/id` | Show recent sessions and pick one interactively | `/id` |
+| `/kill` or `/q` | Kill the currently running AI process | `/kill` |
+| `/send <path>` | Download a file from target machine to Telegram | `/send ~/results/plot.png` |
+| `/send Auto*.png` | Download matching files (wildcard) | `/send /project/Auto*.png` |
+| `/upload <path>` | Upload a file from target machine to cloud | `/upload ~/data/input.csv` |
+| `/scheduled` | Open scheduled tasks manager (edit/delete interactively) | `/scheduled` |
 
 ### Shell Commands
 
@@ -114,13 +120,14 @@ Prefix with `!` to run raw shell commands directly on the target machine (bypass
 Change models persistently (applies to all subsequent messages):
 
 ```
-@@model: opus46@@
+/model
 ```
 
 Or change just for one message:
 
 ```
-@@model: g5@@ explain this error in my GWAS script
+(after selecting model via /model)
+explain this error in my GWAS script
 ```
 
 **Available model aliases (For Github Copilot Pro):**
@@ -140,8 +147,9 @@ Or change just for one message:
 Sessions provide conversation memory. The bot auto-tracks sessions, but you can:
 
 ```
-@@session: ses_abc123@@          # Switch to a specific session
-@@session: new@@                 # Start a fresh session (clear context)
+/id ses_abc123                   # Switch to a specific session
+/new                             # Start a fresh session (clear context)
+/id                              # Show recent sessions to pick
 ```
 
 The AI retains full context within a session -- ask follow-ups without re-explaining.
@@ -155,8 +163,8 @@ The AI retains full context within a session -- ask follow-ups without re-explai
 The AI automatically sends files it creates. You can also request files manually:
 
 ```
-@@send: ~/results/summary.pdf@@
-@@send: /project/output/Auto*.png@@       # wildcard: sends all matching files
+/send ~/results/summary.pdf
+/send /project/output/Auto*.png       # wildcard: sends all matching files
 ```
 
 ### Upload to cloud
@@ -164,7 +172,7 @@ The AI automatically sends files it creates. You can also request files manually
 Upload any file to your pre-configured cloud storage:
 
 ```
-@@upload :~/data/input.csv@@
+/upload ~/data/input.csv
 ```
 
 The file will be transferred to your preferred cloud storage such as google drive or onedrive.
@@ -280,7 +288,7 @@ python3 tools/chat_viewer.py
 
 ```bash
 !python3 /path/to/tools/chat_viewer.py
-@@send:~/opencode_chat_viewer/index.html@@
+/send ~/opencode_chat_viewer/index.html
 # Can be downloaded and viewed on Telegram
 ```
 
@@ -311,7 +319,7 @@ Many HPC clusters **prohibit heavy computation on login nodes**. HPC-Relay is de
 1. **Use the AI agent to generate job scripts** -- not to run heavy computation directly
 2. **Submit jobs** via `sbatch`, `qsub`, etc. directly from the HPC (or using `!` shell commands if supported by your workflow).
 3. **Monitor jobs** through your HPC's scheduling commands (e.g. `squeue`, `qstat`).
-4. **Retrieve results** with `@@send:path@@` or rclone
+4. **Retrieve results** with `/send <path>` or rclone
 
 ### Example
 
@@ -413,3 +421,27 @@ BSD-3 -- free for academic and personal use. See [LICENSE](LICENSE).
 If this helped your workflow, please star the repo -- it helps others find it.
 
 </div>
+
+
+### Schedule Management
+
+Use `/scheduled` to open an interactive task list. Tap a task to:
+- Delete it
+- Edit schedule presets (hourly/daily/once-after)
+
+Use `/scheduled` for all scheduled task management.
+
+
+### Workspace Separation (multi-chat isolation)
+
+HPC-Relay can isolate sessions/tasks/workdir per chat. Configure with env:
+
+```bash
+CHANNEL_WORKSPACES={"8670800334":{"name":"mg","workdir":"~/workspace_mg","allowed_users":[8670800334]}}
+AUTO_WORKSPACE_PER_CHAT=1
+AUTO_WORKSPACE_PREFIX=chat
+```
+
+- Explicit mapping (`CHANNEL_WORKSPACES`) has highest priority.
+- If unmapped and `AUTO_WORKSPACE_PER_CHAT=1`, bot uses namespace `<prefix>_<chat_id>`.
+- Session/task stores become `hpc_relay_sessions_<name>.json` and `hpc_relay_tasks_<name>.json`.
