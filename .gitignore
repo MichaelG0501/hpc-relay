@@ -3,6 +3,7 @@
 *.env
 .env.*
 !.env.example
+hpcrelay/
 
 # Python
 __pycache__/
@@ -39,5 +40,8 @@ Thumbs.db
 opencode_chat_viewer/
 
 # Session data
-oc_sessions.json
-hpc_relay_sessions_ssh.json
+*session*.json
+*task*.json
+
+# Workspace data
+workspace*/

@@ -1084,8 +1084,8 @@
           <div class="feature-icon" style="background:rgba(16,185,129,0.1)">&#x1F4E6;</div>
           <h3>File Transfers</h3>
           <p>Download files from the target machine to Telegram with <code
-              style="font-family:monospace;font-size:12px;color:var(--accent3)">@@send:path@@</code>. Upload from phone
-            with <code style="font-family:monospace;font-size:12px;color:var(--accent3)">@@upload:file@@</code>.
+              style="font-family:monospace;font-size:12px;color:var(--accent3)">/send <path></code>. Upload from phone
+            with <code style="font-family:monospace;font-size:12px;color:var(--accent3)">/upload <path></code>.
             Supports wildcards for batch transfer.</p>
           <span class="tag green">Send + Upload + Wildcards</span>
         </div>
@@ -1116,7 +1116,7 @@
     <div class="container">
       <div class="section-label reveal">Control</div>
       <h2 class="section-title reveal">Commands Reference</h2>
-      <p class="section-sub reveal">Everything you can do from Telegram.</p>
+      <p class="section-sub reveal">Everything you can do from Telegram. Supports per-chat workspace/session isolation via env config.</p>
       <div class="cmd-grid">
 
         <div class="cmd-card reveal">
@@ -1133,39 +1133,45 @@
 
         <div class="cmd-card reveal">
           <div class="cmd-label">Switch Model</div>
-          <div class="cmd-syntax">@@model: opus46@@</div>
-          <div class="cmd-desc">Change AI model. Use alone (persistent) or inline with a prompt.</div>
+          <div class="cmd-syntax">/model</div>
+          <div class="cmd-desc">Open interactive model picker (provider -> model) and switch persistently.</div>
         </div>
 
         <div class="cmd-card reveal">
           <div class="cmd-label">Switch Session</div>
-          <div class="cmd-syntax">@@session: ses_abc123@@</div>
-          <div class="cmd-desc">Jump to a specific session for conversation context.</div>
+          <div class="cmd-syntax">/id ses_abc123</div>
+          <div class="cmd-desc">Switch sessions by ID (or run /id to pick from recent sessions).</div>
         </div>
 
         <div class="cmd-card reveal">
           <div class="cmd-label">Kill Process</div>
-          <div class="cmd-syntax">@@kill@@ or !kill</div>
-          <div class="cmd-desc">Terminate the currently running AI process immediately.</div>
+          <div class="cmd-syntax">/kill or /q</div>
+          <div class="cmd-desc">Terminate the currently running AI process immediately (/kill or /q).</div>
         </div>
 
         <div class="cmd-card reveal">
           <div class="cmd-label">Download File</div>
-          <div class="cmd-syntax">@@send:~/results/plot.png@@</div>
+          <div class="cmd-syntax">/send ~/results/plot.png</div>
           <div class="cmd-desc">Fetch a file from HPC and receive it in Telegram.</div>
         </div>
 
         <div class="cmd-card reveal">
           <div class="cmd-label">Wildcard Fetch</div>
-          <div class="cmd-syntax">@@send:Auto*.png@@</div>
+          <div class="cmd-syntax">/send Auto*.png</div>
           <div class="cmd-desc">Download all matching files. Supports glob patterns.</div>
         </div>
 
         <div class="cmd-card reveal">
           <div class="cmd-label">Upload File</div>
-          <div class="cmd-syntax">@@upload:~/data/input.csv@@</div>
+          <div class="cmd-syntax">/upload ~/data/input.csv</div>
           <div class="cmd-desc">Send a file from your phone to a path on HPC. Use as caption when sending a document.
           </div>
+        </div>
+
+        <div class="cmd-card reveal">
+          <div class="cmd-label">Scheduled Tasks</div>
+          <div class="cmd-syntax">/scheduled</div>
+          <div class="cmd-desc">Open interactive scheduled task manager (view/edit/delete).</div>
         </div>
 
       </div>
@@ -1328,7 +1334,7 @@
             <li>You: <code style="font-family:monospace;font-size:12px;color:var(--accent3)">!squeue -u $USER</code>
             </li>
             <li>You: <code
-                style="font-family:monospace;font-size:12px;color:var(--accent3)">@@send:~/results/output.pdf@@</code>
+                style="font-family:monospace;font-size:12px;color:var(--accent3)">/send ~/results/output.pdf</code>
             </li>
           </ul>
         </div>

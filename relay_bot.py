@@ -17,12 +17,12 @@ import traceback
 import threading
 import schedule
 from datetime import datetime, timedelta
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List, Dict
 from pathlib import Path
 
 from dotenv import load_dotenv
-from telegram import Update
-from telegram.ext import Application, MessageHandler, ContextTypes, filters
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+from telegram.ext import Application, MessageHandler, ContextTypes, CommandHandler, CallbackQueryHandler, filters
 from telegram.constants import ParseMode
 
 # Load .env from the same directory as this script
@@ -236,37 +236,6 @@ CONNECTION_MODE = os.environ.get("CONNECTION_MODE", "ssh").lower()
 OPENCODE = os.environ.get("OPENCODE_PATH", "opencode")
 DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "opencode/minimax-m2.5-free")
 
-MODEL_ALIASES = {
-    "pickle": "opencode/big-pickle",
-    "nano": "opencode/gpt-5-nano",
-    "m25": "opencode/minimax-m2.5-free",
-    "trinity": "opencode/trinity-large-preview-free",
-    "haiku": "github-copilot/claude-haiku-4.5",
-    "opus45": "github-copilot/claude-opus-4.5",
-    "opus46": "github-copilot/claude-opus-4.6",
-    "opus41": "github-copilot/claude-opus-41",
-    "sonnet4": "github-copilot/claude-sonnet-4",
-    "sonnet45": "github-copilot/claude-sonnet-4.5",
-    "sonnet46": "github-copilot/claude-sonnet-4.6",
-    "g25": "github-copilot/gemini-2.5-pro",
-    "g3f": "github-copilot/gemini-3-flash-preview",
-    "g3p": "github-copilot/gemini-3-pro-preview",
-    "g31": "github-copilot/gemini-3.1-pro-preview",
-    "g41": "github-copilot/gpt-4.1",
-    "g4o": "github-copilot/gpt-4o",
-    "g5": "github-copilot/gpt-5",
-    "g5m": "github-copilot/gpt-5-mini",
-    "g51": "github-copilot/gpt-5.1",
-    "c51": "github-copilot/gpt-5.1-codex",
-    "c51x": "github-copilot/gpt-5.1-codex-max",
-    "c51m": "github-copilot/gpt-5.1-codex-mini",
-    "g52": "github-copilot/gpt-5.2",
-    "c52": "github-copilot/gpt-5.2-codex",
-    "grok": "github-copilot/grok-code-fast-1",
-}
-
-# All known full model names (values from aliases + common direct names)
-KNOWN_MODELS = set(MODEL_ALIASES.values()) | {DEFAULT_MODEL}
 
 WORKDIR = os.environ.get("WORKDIR", os.environ.get("HPC_WORKDIR", "~"))
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
@@ -283,7 +252,7 @@ _setup_raw = os.environ.get(
 )
 SETUP_CMD = _setup_raw.strip() if _setup_raw.strip() else None
 
-# rclone destination for the @@upload:@@ directive (remote:path format).
+# rclone destination for upload command (remote:path format).
 # Examples:  gdrive:HPC-Results    s3:mybucket/results    onedrive:Projects
 RCLONE_DEST = os.environ.get("RCLONE_DEST", "gdrive:HPC-Results")
 
@@ -295,6 +264,7 @@ SESSIONS_FILE = os.environ.get(
     str(SCRIPT_DIR / f"hpc_relay_sessions_{CONNECTION_MODE}.json"),
 )
 TG_CHUNK = 3800  # conservative; Telegram max is 4096
+SHOW_META_HEADER = False  # default: chat like a human; use /status for details
 
 STREAM_EDIT_INTERVAL = 1.5
 STREAM_MIN_DELTA = 80
@@ -309,17 +279,17 @@ OC_DB_PATH = os.environ.get(
 )  # on HPC
 
 SYSTEM_SUFFIX = (
-    " FORMAT: All your output / reply should strictly be in proper Markdown format."
-    " Use ## or ### for section headers."
-    " Use **bold** for key terms and labels."
-    " Use `backticks` for code/commands."
-    " Use - for bullet lists and indent sub-items with 2 spaces."
-    " Use numbered lists (1. 2. 3.) for sequential steps."
-    " Use > for important callouts."
-    " Use ```lang for code blocks."
-    " Keep reply concise and highly structured."
+    " STYLE: Default to natural, human conversational replies in plain text."
+
+    " Only use heavy structure (headers/lists/code blocks) when it genuinely improves clarity"
+    " for technical or multi-step content. For simple questions, answer as a short normal paragraph."
+    " MEMORY BOOTSTRAP: At the beginning of each new task, read local files in current workdir in this order:"
+    " `./MEMORY.md` then `./AGENTS.md` (if present). If missing, create MEMORY.md in current workdir and continue."
+    " If reading fails or permissions reject, continue answering normally without stopping."
     " IMPORTANT: Headless / non-interactive mode (`opencode run`)."
     " Do NOT invoke ask_questions tool"
+    " If any tool call is denied/rejected, continue and provide the best possible direct answer instead of stopping."
+    " Avoid reading external directories unless the user explicitly asks. Prefer local workspace files first."
     " Unless explicitly told not to by the user, automatically output "
     "exactly `@@SEND_FILE: <filepath>@@` whenever you create or reference "
     "a small output file (like a png, pdf, or short dataset)."
@@ -329,10 +299,66 @@ SYSTEM_SUFFIX = (
     "response. For <time_format>, use `every X minutes/hours/days`, "
     "`at HH:MM`, or `after X minutes/hours`.")
 
-MODEL_RE = re.compile(r"@@model:\s*(.+?)@@", re.IGNORECASE)
-SESSION_RE = re.compile(r"@@session:\s*(.+?)@@", re.IGNORECASE)
 SHELL_PREFIX = "!"
 
+# ================================================================
+#  CHANNEL -> WORKSPACE ROUTING
+# ================================================================
+_CW_RAW = os.environ.get("CHANNEL_WORKSPACES", "").strip()
+CHANNEL_WORKSPACES: dict = {}
+if _CW_RAW:
+    try:
+        CHANNEL_WORKSPACES = json.loads(_CW_RAW)
+    except json.JSONDecodeError as _e:
+        print(f"  [WARN] CHANNEL_WORKSPACES is invalid JSON: {_e}")
+
+AUTO_WORKSPACE_PER_CHAT = os.environ.get("AUTO_WORKSPACE_PER_CHAT", "0").strip().lower() in {"1", "true", "yes", "on"}
+AUTO_WORKSPACE_PREFIX = os.environ.get("AUTO_WORKSPACE_PREFIX", "chat")
+
+
+def _resolve_workspace(chat_id: int, user_id: int = None) -> dict:
+    """Return workspace config for a given chat_id.
+
+    Build workspace-specific file paths and system suffix.
+    """
+    ws = CHANNEL_WORKSPACES.get(str(chat_id))
+    if ws:
+        name = ws.get("name", f"ws_{chat_id}")
+        wdir = ws.get("workdir", WORKDIR)
+        allowed = ws.get("allowed_users")
+        if allowed is not None:
+            allowed = [int(u) for u in allowed]
+    else:
+        if AUTO_WORKSPACE_PER_CHAT and chat_id is not None:
+            name = f"{AUTO_WORKSPACE_PREFIX}_{chat_id}"
+            wdir = WORKDIR
+        else:
+            name = None
+            wdir = WORKDIR
+        allowed = None
+    # Build workspace-specific file paths
+    if name:
+        tfile = str(SCRIPT_DIR / f"hpc_relay_tasks_{name}.json")
+        sfile = str(SCRIPT_DIR / f"hpc_relay_sessions_{name}.json")
+    else:
+        tfile = TASKS_FILE
+        sfile = SESSIONS_FILE
+    # Use workspace-specific suffix if available
+    if name:
+        suffix = SYSTEM_SUFFIX + f" Your workspace / long-term memory directory is '{wdir}'. Read and write your persistent notes and schedule data from files in this directory."
+    else:
+        suffix = SYSTEM_SUFFIX
+    return {"workdir": wdir, "name": name, "tasks_file": tfile, "sessions_file": sfile, "system_suffix": suffix, "allowed_users": allowed}
+
+
+INBOX_DIR = SCRIPT_DIR / "inbox"
+INBOX_DIR.mkdir(exist_ok=True)
+
+ws_sf = SESSIONS_FILE
+ws_tf = TASKS_FILE
+
+
+OPENCODE_RUN_LOCK = asyncio.Lock()
 
 # ================================================================
 #  SCHEDULED TASK MANAGER
@@ -343,19 +369,21 @@ _scheduler_thread = None
 _scheduler_lock = threading.Lock()
 
 
-def _load_scheduled_tasks() -> dict:
+def _load_scheduled_tasks(tasks_file=None) -> dict:
+    tf = tasks_file or TASKS_FILE
     try:
-        with open(TASKS_FILE) as f:
+        with open(tf) as f:
             return json.load(f)
     except Exception:
         return {}
 
 
-def _save_scheduled_tasks(tasks: dict):
-    tmp = f"{TASKS_FILE}.{os.getpid()}.tmp"
+def _save_scheduled_tasks(tasks: dict, tasks_file=None):
+    tf = tasks_file or TASKS_FILE
+    tmp = f"{tf}.{os.getpid()}.tmp"
     with open(tmp, "w") as f:
         json.dump(tasks, f, indent=2)
-    os.replace(tmp, TASKS_FILE)
+    os.replace(tmp, tf)
 
 
 def _run_scheduled_task(task_id: str, task_info: dict):
@@ -366,7 +394,11 @@ def _run_scheduled_task(task_id: str, task_info: dict):
 
     print(f"  [SCHEDULED TASK {task_id}] Running:{task[:50]}...")
 
-    prompt = task + SYSTEM_SUFFIX
+    ws = _resolve_workspace(chat_id) if chat_id else {}
+    ws_sf = ws.get("sessions_file", SESSIONS_FILE)
+    ws_wd = ws.get("workdir", WORKDIR)
+    ws_suffix = ws.get("system_suffix", SYSTEM_SUFFIX)
+    prompt = task + ws_suffix
 
     async def _execute():
         status_msg = None
@@ -423,8 +455,16 @@ def _run_scheduled_task(task_id: str, task_info: dict):
 
         try:
             final, new_sid = await run_opencode(
-                prompt, chat_id, model, session_id, on_progress, on_text_chunk
+                prompt, chat_id, model, session_id, on_progress, on_text_chunk, workdir=ws_wd, sessions_file=ws_sf
             )
+
+            # If scheduled task points to a stale session (from another host/bot),
+            # auto-retry once with a fresh session instead of surfacing legacy guidance.
+            if isinstance(final, str) and "Session does not exist on this machine" in final:
+                await on_progress(f"{E.RETRY} Scheduled task session invalid; retrying with a new session...")
+                final, new_sid = await run_opencode(
+                    prompt, chat_id, model, None, on_progress, on_text_chunk, workdir=ws_wd, sessions_file=ws_sf
+                )
         except Exception as e:
             final = f"{E.ERR} Task failed: {e}\n\n" + ("".join(text_buf))
             new_sid = session_id
@@ -433,19 +473,7 @@ def _run_scheduled_task(task_id: str, task_info: dict):
 
         if chat_id and _app:
             try:
-                header = _header_html(
-                    model,
-                    _display_sid(
-                        new_sid or session_id or "scheduled",
-                        is_new=not session_id,
-                    ),
-                )
-                body = md_to_tg_html(final or "No output.")
-                final_msg = (
-                    header
-                    + body
-                    + f"\n\n{E.OK} <b>[Scheduled Task ({task_id.split('_')[1] if '_' in task_id else task_id}) Completed]</b>"
-                )
+                final_msg = md_to_tg_html(final or "No output.")
 
                 # Extract schedules within scheduled task
                 scheduled_tasks_to_add = re.findall(
@@ -505,16 +533,17 @@ def _run_scheduled_task(task_id: str, task_info: dict):
 
                         if new_info:
                             new_task_id = f"task_{int(time.time())}_{len(scheduled_hint)}"
-                            tasks = _load_scheduled_tasks()
+                            tasks = _load_scheduled_tasks(ws_tf)
                             tasks[new_task_id] = {
                                 "schedule": new_info,
                                 "task": new_info["task"],
                                 "chat_id": chat_id,
                                 "model": model,
                                 "session_id": new_sid,
-                                "created_at": datetime.datetime.now().isoformat(),
+                                "created_at": datetime.now().isoformat(),
+                                "tasks_file": ws_tf,
                             }
-                            _save_scheduled_tasks(tasks)
+                            _save_scheduled_tasks(tasks, ws_tf)
                             import html
 
                             _schedule_job(new_task_id, tasks[new_task_id])
@@ -542,15 +571,7 @@ def _run_scheduled_task(task_id: str, task_info: dict):
                 )
 
                 # Send files parsing
-                files_to_send = re.findall(
-                    r"@@SEND_FILE:\s*(.+?)@@", final, re.IGNORECASE
-                )
-                seen_files = set()
-                unique_files = [
-                    f.strip(" @")
-                    for f in files_to_send
-                    if not (f in seen_files or seen_files.add(f))
-                ]
+                unique_files = _extract_send_file_directives(final)
 
                 if unique_files:
 
@@ -608,6 +629,37 @@ def _run_scheduled_task(task_id: str, task_info: dict):
         asyncio.run_coroutine_threadsafe(_execute(), _loop)
 
 
+def _all_task_files() -> list:
+    files = {str(TASKS_FILE)}
+    for _cid, ws_cfg in CHANNEL_WORKSPACES.items():
+        n = ws_cfg.get("name")
+        if n:
+            files.add(str(SCRIPT_DIR / f"hpc_relay_tasks_{n}.json"))
+    if AUTO_WORKSPACE_PER_CHAT:
+        for tf in SCRIPT_DIR.glob(f"hpc_relay_tasks_{AUTO_WORKSPACE_PREFIX}_*.json"):
+            files.add(str(tf))
+    return sorted(files)
+
+
+def _find_task_file(task_id: str, preferred_tf: str):
+    for tf in [preferred_tf] + [x for x in _all_task_files() if x != preferred_tf]:
+        tasks = _load_scheduled_tasks(tf)
+        if task_id in tasks:
+            return tf, tasks
+    return preferred_tf, _load_scheduled_tasks(preferred_tf)
+
+
+def _collect_chat_tasks(chat_id: int, preferred_tf: str) -> dict:
+    out = {}
+    for tf in [preferred_tf] + [x for x in _all_task_files() if x != preferred_tf]:
+        tasks = _load_scheduled_tasks(tf)
+        for tid, info in tasks.items():
+            if info.get("chat_id") == chat_id:
+                if tid not in out:
+                    out[tid] = (info, tf)
+    return out
+
+
 def _schedule_job(task_id: str, task_info: dict):
     info = task_info.get("schedule", {})
     task_type = info.get("type")
@@ -635,10 +687,11 @@ def _schedule_job(task_id: str, task_info: dict):
             def _delayed_run():
                 _run_scheduled_task(task_id, task_info)
                 # Remove self after run
-                tasks = _load_scheduled_tasks()
+                tf_local = task_info.get("tasks_file", TASKS_FILE)
+                tasks = _load_scheduled_tasks(tf_local)
                 if task_id in tasks:
                     del tasks[task_id]
-                    _save_scheduled_tasks(tasks)
+                    _save_scheduled_tasks(tasks, tf_local)
 
             # Start timer using the actual delay
             threading.Timer(delay, _delayed_run).start()
@@ -682,10 +735,24 @@ def _start_scheduler():
     _scheduler_thread = threading.Thread(target=_scheduler_worker, daemon=True)
     _scheduler_thread.start()
 
-    tasks = _load_scheduled_tasks()
-    for task_id, task_info in tasks.items():
-        _schedule_job(task_id, task_info)
-    print(f"  [SCHEDULER] Started, loaded {len(tasks)} tasks")
+    # Load tasks from ALL workspace-specific task files + global
+    all_task_files = {TASKS_FILE}
+    for _cid, ws_cfg in CHANNEL_WORKSPACES.items():
+        name = ws_cfg.get("name")
+        if name:
+            all_task_files.add(str(SCRIPT_DIR / f"hpc_relay_tasks_{name}.json"))
+    if AUTO_WORKSPACE_PER_CHAT:
+        for tf in SCRIPT_DIR.glob(f"hpc_relay_tasks_{AUTO_WORKSPACE_PREFIX}_*.json"):
+            all_task_files.add(str(tf))
+
+    total = 0
+    for tf in all_task_files:
+        tasks = _load_scheduled_tasks(tf)
+        for task_id, task_info in tasks.items():
+            task_info.setdefault("tasks_file", tf)
+            _schedule_job(task_id, task_info)
+        total += len(tasks)
+    print(f"  [SCHEDULER] Started, loaded {total} tasks")
 
 
 def _stop_scheduler():
@@ -706,24 +773,26 @@ def set_app_context(app, loop):
 # ================================================================
 #  PERSISTENCE  (with session history tracking)
 # ================================================================
-def _load_store() -> dict:
+def _load_store(sessions_file=None) -> dict:
+    sf = sessions_file or SESSIONS_FILE
     try:
-        with open(SESSIONS_FILE) as f:
+        with open(sf) as f:
             d = json.load(f)
             return d if isinstance(d, dict) else {}
     except Exception:
         return {}
 
 
-def _save_store(d: dict):
-    tmp = f"{SESSIONS_FILE}.{os.getpid()}.tmp"
+def _save_store(d: dict, sessions_file=None):
+    sf = sessions_file or SESSIONS_FILE
+    tmp = f"{sf}.{os.getpid()}.tmp"
     with open(tmp, "w") as f:
         json.dump(d, f, indent=2)
-    os.replace(tmp, SESSIONS_FILE)
+    os.replace(tmp, sf)
 
 
-def get_chat(cid: int) -> dict:
-    v = _load_store().get(str(cid), {})
+def get_chat(cid: int, sessions_file=None) -> dict:
+    v = _load_store(sessions_file).get(str(cid), {})
     if isinstance(v, str):
         v = {"session_id": v}
     v.setdefault("model", DEFAULT_MODEL)
@@ -731,32 +800,55 @@ def get_chat(cid: int) -> dict:
     return v
 
 
-def update_chat(cid: int, **kw):
-    store = _load_store()
+def update_chat(cid: int, sessions_file=None, **kw):
+    store = _load_store(sessions_file)
     key = str(cid)
     cur = store.get(key, {})
     if isinstance(cur, str):
         cur = {"session_id": cur, "model": DEFAULT_MODEL}
     cur.update({k: v for k, v in kw.items() if v is not None})
     store[key] = cur
-    _save_store(store)
+    _save_store(store, sessions_file)
 
 
-def _record_session(sid: str):
+def _record_session(sid: str, sessions_file=None):
     """Add a session ID to the known_sessions history."""
     if not sid or not sid.startswith("ses"):
         return
-    store = _load_store()
+    store = _load_store(sessions_file)
     history = store.get("__known_sessions__", [])
     if sid not in history:
         history.append(sid)
         store["__known_sessions__"] = history
-        _save_store(store)
+        _save_store(store, sessions_file)
 
 
-def _get_known_sessions() -> list:
+def _set_session_model(sid: str, model: str, sessions_file=None):
+    if not sid or not sid.startswith("ses") or not model:
+        return
+    store = _load_store(sessions_file)
+    m = store.get("__session_models__", {})
+    if not isinstance(m, dict):
+        m = {}
+    m[sid] = model
+    store["__session_models__"] = m
+    _save_store(store, sessions_file)
+
+
+def _get_session_model(sid: str, sessions_file=None) -> Optional[str]:
+    if not sid or not sid.startswith("ses"):
+        return None
+    store = _load_store(sessions_file)
+    m = store.get("__session_models__", {})
+    if not isinstance(m, dict):
+        return None
+    v = m.get(sid)
+    return v if isinstance(v, str) and v else None
+
+
+def _get_known_sessions(sessions_file=None) -> list:
     """Return list of all session IDs ever seen (local cache)."""
-    return _load_store().get("__known_sessions__", [])
+    return _load_store(sessions_file).get("__known_sessions__", [])
 
 
 async def _fetch_hpc_sessions() -> list[Tuple[str, str]]:
@@ -860,21 +952,14 @@ async def _is_valid_session(sid: str) -> bool:
 #  MESSAGE PARSING
 # ================================================================
 def parse_message(text: str) -> dict:
-    out = {"model": None, "session": None, "shell": None, "prompt": None}
+    """Parse plain user text.
+
+    Inline control syntax is disabled. Use slash commands instead.
+    """
+    out = {"shell": None, "prompt": None}
     if text.startswith(SHELL_PREFIX):
         out["shell"] = text[len(SHELL_PREFIX):].strip()
         return out
-    m = MODEL_RE.search(text)
-    if m:
-        req = m.group(1).strip().lower()
-        out["model"] = MODEL_ALIASES.get(req, req)
-        text = MODEL_RE.sub("", text)
-    s = SESSION_RE.search(text)
-    if s:
-        val = s.group(1).strip()
-        out["session"] = "new" if val.lower() == "new" else val
-        text = SESSION_RE.sub("", text)
-
     out["prompt"] = text.strip() or None
     return out
 
@@ -922,23 +1007,31 @@ def _safe_path(p: str) -> str:
     return shlex.quote(p)
 
 
-def _oc_script(prompt, sid, model):
+def _oc_script(prompt, sid, model, attached_files=None, workdir=None, unique_token=""):
     sess = (
         f"--session {shlex.quote(sid)} "
         if sid and sid.startswith("ses")
         else ""
     )
     setup = (SETUP_CMD + "\n") if SETUP_CMD else ""
+    file_args = ""
+    for fp in (attached_files or []):
+        file_args += f" -f {shlex.quote(fp)}"
+    wd = workdir or WORKDIR
+    pid_cmd = f"echo $$ > relay_pid_{unique_token}.pid\n" if unique_token else ""
     return (
         f"set -euo pipefail\n{setup}"
-        f"cd {_safe_path(WORKDIR)}\n"
-        f"{_safe_path(OPENCODE)} run -m {shlex.quote(model)} "
-        f"--format json {sess}{shlex.quote(prompt)} 2>&1\n"
+        f"mkdir -p {_safe_path(wd)} && cd {_safe_path(wd)}\n"
+        f"rm -f {_safe_path(OC_DB_PATH)}-shm 2>/dev/null || true\n"
+        f"{pid_cmd}"
+        f"exec {_safe_path(OPENCODE)} run -m {shlex.quote(model)} "
+        f"--format json {sess}{file_args} -- {shlex.quote(prompt)} 2>&1\n"
     )
 
 
-def _shell_script(cmd):
-    return f"cd {_safe_path(WORKDIR)} && {{ {cmd} ; }} 2>&1\n"
+def _shell_script(cmd, workdir=None):
+    wd = workdir or WORKDIR
+    return f"mkdir -p {_safe_path(wd)} && cd {_safe_path(wd)} && {{ {cmd} ; }} 2>&1\n"
 
 
 # ================================================================
@@ -952,6 +1045,43 @@ def _parse_ev(raw):
         return json.loads(line)
     except Exception:
         return {}
+
+
+def _extract_send_file_directives(text: str) -> List[str]:
+    """Extract @@SEND_FILE directives robustly.
+
+    Accepts either:
+      @@SEND_FILE: /path/to/file@@
+    or line form:
+      @@SEND_FILE: /path/to/file
+    In both cases, only the path token is captured; trailing text is ignored.
+    """
+    if not text:
+        return []
+    paths: List[str] = []
+
+    # strict form enclosed by @@
+    for m in re.finditer(r"@@SEND_FILE:\s*([^@\n\r]+?)\s*@@", text, re.IGNORECASE):
+        paths.append(m.group(1).strip())
+
+    # line form (no trailing @@), capture only first token-like path segment
+    for m in re.finditer(r"^\s*@@SEND_FILE:\s*(.+)$", text, re.IGNORECASE | re.MULTILINE):
+        line = m.group(1).strip()
+        if "@@" in line:
+            line = line.split("@@", 1)[0].strip()
+        # keep only first whitespace-delimited token to avoid grabbing explanation text
+        token = line.split()[0] if line else ""
+        if token:
+            paths.append(token)
+
+    # de-dup preserving order
+    seen = set()
+    out = []
+    for pth in paths:
+        if pth not in seen:
+            seen.add(pth)
+            out.append(pth)
+    return out
 
 
 def _parse_all(output) -> Tuple[Optional[str], Optional[str]]:
@@ -990,7 +1120,7 @@ def _parse_all(output) -> Tuple[Optional[str], Optional[str]]:
 # ================================================================
 #  SHELL EXEC
 # ================================================================
-async def exec_shell(cmd):
+async def exec_shell(cmd, workdir=None):
     if CONNECTION_MODE in ("wsl", "local"):
         ssh_cmd = _ssh_base() + [
             "timeout",
@@ -1008,7 +1138,7 @@ async def exec_shell(cmd):
         limit=1024 * 1024 * 16,
     )
     stdout, _ = await asyncio.wait_for(
-        proc.communicate(_shell_script(cmd).encode()), LOCAL_TIMEOUT_SEC
+        proc.communicate(_shell_script(cmd, workdir).encode()), LOCAL_TIMEOUT_SEC
     )
     out = stdout.decode(errors="replace").strip()
     rc = proc.returncode
@@ -1021,9 +1151,11 @@ async def exec_shell(cmd):
 #  STREAMING OPENCODE
 # ================================================================
 async def run_opencode(
-    prompt, chat_id, model, session_id, on_progress, on_text_chunk
+    prompt, chat_id, model, session_id, on_progress, on_text_chunk, attached_files=None,
+    workdir=None, sessions_file=None,
 ):
-    script = _oc_script(prompt, session_id, model)
+    unique_token = f"relay_run_{int(time.time()*1000)}_{os.getpid()}"
+    script = _oc_script(prompt, session_id, model, attached_files, workdir, unique_token)
     if CONNECTION_MODE in ("wsl", "local"):
         ssh_cmd = _ssh_base() + [
             "timeout",
@@ -1045,7 +1177,19 @@ async def run_opencode(
         proc.stdin.write(script.encode())
         await proc.stdin.drain()
         proc.stdin.close()
-        prev_text_len = 0
+
+        def _force_kill():
+            kill_cmd = f"kill -9 $(cat {_safe_path(workdir or WORKDIR)}/relay_pid_{unique_token}.pid 2>/dev/null) 2>/dev/null || true"
+            if CONNECTION_MODE in ("wsl", "local"):
+                subprocess.run(["bash", "-c", kill_cmd], capture_output=True)
+            else:
+                subprocess.run(_ssh_base() + ["bash", "-c", kill_cmd], capture_output=True)
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+        prev_text = ""
         latest_sid = None
         lines = []
         t0 = time.time()
@@ -1059,14 +1203,14 @@ async def run_opencode(
             # freezes python.
             if now_t - getattr(proc, "_last_kill_check", 0) > 3.0:
                 proc._last_kill_check = now_t
-                chat_now = get_chat(chat_id)
+                chat_now = get_chat(chat_id, sessions_file)
                 if chat_now.get("kill_requested") == "yes":
-                    proc.kill()
-                    update_chat(chat_id, kill_requested="no")
+                    _force_kill()
+                    update_chat(chat_id, ws_sf, kill_requested="no")
                     raise RuntimeError("Stopped by user (kill signal).")
 
             if elapsed > LOCAL_TIMEOUT_SEC:
-                proc.kill()
+                _force_kill()
                 raise subprocess.TimeoutExpired(ssh_cmd, LOCAL_TIMEOUT_SEC)
 
             try:
@@ -1075,7 +1219,7 @@ async def run_opencode(
                 silence = time.time() - last_json_t
                 if silence > 180:
                     await on_progress(
-                        f"{E.WARN} Silent 3+ mins (ask_question pending?). Send @@kill@@. [{int(elapsed)}s]"
+                        f"{E.WARN} Silent 3+ mins (ask_question pending?). Send /kill. [{int(elapsed)}s]"
                     )
                 else:
                     await on_progress(
@@ -1087,7 +1231,6 @@ async def run_opencode(
                 break
 
             # Explicit yield to ensure Telegram's event loop can fetch network
-            # payloads like @@kill@@!
             await asyncio.sleep(0.01)
 
             decoded = raw.decode(errors="replace")
@@ -1096,7 +1239,7 @@ async def run_opencode(
                 # Infinite garbage spam warning
                 if time.time() - last_json_t > 180:
                     await on_progress(
-                        f"{E.WARN} 3+ mins non-JSON spam (stuck loop?). Send @@kill@@. [{int(elapsed)}s]"
+                        f"{E.WARN} 3+ mins non-JSON spam (stuck loop?). Send /kill. [{int(elapsed)}s]"
                     )
                 # Non-JSON lines: only store if small
                 if len(decoded) < 5000:
@@ -1150,7 +1293,7 @@ async def run_opencode(
                 await on_progress(
                     f"{E.WARN} Model invoked ask_question in headless mode. Terminating."
                 )
-                proc.kill()
+                _force_kill()
                 raise RuntimeError(
                     "Model attempted to use ask_question tool, which hangs in headless mode."
                 )
@@ -1178,28 +1321,43 @@ async def run_opencode(
             if etype == "text":
                 t = part.get("text")
                 if isinstance(t, str) and t.strip():
-                    delta = t[prev_text_len:]
-                    prev_text_len = len(t)
+                    # Some providers stream cumulative text, others may reset chunks.
+                    # Handle both robustly to avoid half/missing replies.
+                    if prev_text and t.startswith(prev_text):
+                        delta = t[len(prev_text):]
+                    else:
+                        delta = t
+                    prev_text = t
                     if delta.strip():
                         await on_text_chunk(delta)
         rc = await proc.wait()
         return rc, "".join(lines), latest_sid
 
-    try:
-        rc, output, sid = await _once()
-    except subprocess.TimeoutExpired:
-        if RETRY_ON_TIMEOUT:
-            await asyncio.to_thread(_close_master)
-            await on_progress(f"{E.RETRY} Retrying...")
+    async with OPENCODE_RUN_LOCK:
+        try:
             rc, output, sid = await _once()
-        else:
-            raise
+        except subprocess.TimeoutExpired:
+            if RETRY_ON_TIMEOUT:
+                await asyncio.to_thread(_close_master)
+                await on_progress(f"{E.RETRY} Retrying...")
+                rc, output, sid = await _once()
+            else:
+                raise
+
+        lock_markers = ("locking protocol", "database is locked", "sqlite_busy")
+        if any(m in (output or "").lower() for m in lock_markers):
+            await on_progress(f"{E.RETRY} Detected lock contention, retrying once...")
+            await asyncio.sleep(2)
+            rc2, output2, sid2 = await _once()
+            rc, output = rc2, output2
+            if sid2:
+                sid = sid2
 
     _, final_text = _parse_all(output)
 
     returned_sid = sid
     if isinstance(returned_sid, str) and returned_sid.startswith("ses"):
-        update_chat(chat_id, session_id=returned_sid)
+        update_chat(chat_id, sessions_file, session_id=returned_sid)
         _record_session(returned_sid)  # track in history
 
     if not final_text:
@@ -1207,7 +1365,7 @@ async def run_opencode(
             raw_msg = (
                 f"{E.WARN} **Session does not exist on this machine!**\n"
                 "It seems you passed a session ID from the other bot. "
-                "Please type `@@session: new@@` to start a new session "
+                "Please type `/new` to start a new session "
                 "on this host."
             )
         else:
@@ -1423,7 +1581,7 @@ for match in matches:
         bash_script = f"""
 abs={shlex.quote(f)}
 size=$(stat -c%s "$abs")
-if (( size > 40000000 )); then echo "ERR: File too large (Size is $size bytes. Max allowed is 40MB). Please use @@upload: instead." >&2; exit 1; fi
+if (( size > 40000000 )); then echo "ERR: File too large (Size is $size bytes. Max allowed is 40MB). Please use /upload instead." >&2; exit 1; fi
 cat "$abs"
 """
         cmd = _ssh_base() + ["bash", "-s"]
@@ -1484,9 +1642,678 @@ cat "$abs"
             )
 
 
+async def _extract_user_prompt_and_files(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> Tuple[str, List[str]]:
+    """Extract user text/caption and download image attachments locally."""
+    msg = update.message
+    raw = ((msg.text or msg.caption) or "").strip()
+    files: List[str] = []
+
+    if msg.photo:
+        try:
+            largest = msg.photo[-1]
+            tg_file = await context.bot.get_file(largest.file_id)
+            fname = f"tg_{chat_id}_{int(time.time()*1000)}_{largest.file_unique_id}.jpg"
+            local_path = INBOX_DIR / fname
+            await tg_file.download_to_drive(custom_path=str(local_path))
+            files.append(str(local_path))
+        except Exception as e:
+            print(f"  [photo download failed: {e}]")
+
+    doc = msg.document
+    if doc and (doc.mime_type or "").startswith("image/"):
+        try:
+            tg_file = await context.bot.get_file(doc.file_id)
+            suffix = Path(doc.file_name).suffix if doc.file_name else ""
+            if not suffix:
+                mime = (doc.mime_type or "").split("/")[-1] or "bin"
+                suffix = "." + mime
+            fname = f"tg_{chat_id}_{int(time.time()*1000)}_{doc.file_unique_id}{suffix}"
+            local_path = INBOX_DIR / fname
+            await tg_file.download_to_drive(custom_path=str(local_path))
+            files.append(str(local_path))
+        except Exception as e:
+            print(f"  [image document download failed: {e}]")
+
+    return raw, files
+
+
+def _fallback_models() -> List[str]:
+    """Static fallback when opencode model enumeration is unavailable."""
+    return [
+        "github-copilot/gpt-4o",
+        "github-copilot/gpt-4.1",
+        "github-copilot/gpt-5",
+        "github-copilot/gpt-5-mini",
+        "github-copilot/claude-sonnet-4.5",
+        "github-copilot/claude-opus-4.5",
+        "github-copilot/gemini-2.5-pro",
+        DEFAULT_MODEL,
+    ]
+
+
+async def _list_available_models() -> List[str]:
+    """Fetch model list dynamically (used by /model flow).
+
+    Falls back to a curated static list when opencode cannot enumerate models
+    (common on DB lock / transient runtime issues in WSL).
+    """
+    script = f"{_safe_path(OPENCODE)} models"
+    if CONNECTION_MODE in ("wsl", "local"):
+        cmd = ["bash", "-lc", script]
+    else:
+        cmd = _ssh_base() + ["bash", "-lc", script]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        out, err = await asyncio.wait_for(proc.communicate(), 25)
+        txt = (out or b"").decode(errors="replace")
+        etxt = (err or b"").decode(errors="replace")
+        models = [
+            ln.strip()
+            for ln in txt.splitlines()
+            if ln.strip() and "/" in ln and " " not in ln.strip()
+        ]
+        models = sorted(set(models))
+        if models:
+            return models
+        if etxt.strip():
+            print(f"  [_list_available_models empty stdout; stderr: {etxt[:300]}]")
+    except Exception as e:
+        print(f"  [_list_available_models error: {e}]")
+
+    fb = sorted(set(_fallback_models()))
+    print(f"  [_list_available_models fallback -> {len(fb)} models]")
+    return fb
+
+
+def _models_by_provider(models: List[str]) -> dict:
+    grouped = {}
+    for m in models:
+        provider = m.split("/", 1)[0]
+        grouped.setdefault(provider, []).append(m)
+    for k in grouped:
+        grouped[k] = sorted(grouped[k])
+    return dict(sorted(grouped.items()))
+
+
+def _parse_schedule_text(text: str, task_prompt: str = "") -> Optional[dict]:
+    t = (text or "").strip().lower()
+    m = re.match(r"^every\s+(\d+)\s+(minute|minutes|hour|hours|day|days)$", t)
+    if m:
+        n = int(m.group(1))
+        unit = m.group(2)
+        if unit.endswith('s') is False:
+            unit += 's'
+        return {"type": "interval", "interval": n, "unit": unit, "task": task_prompt}
+
+    m = re.match(r"^(?:daily\s+|at\s+)(\d{1,2}):(\d{2})$", t)
+    if m:
+        h = int(m.group(1))
+        mi = int(m.group(2))
+        if 0 <= h <= 23 and 0 <= mi <= 59:
+            return {"type": "daily", "hour": h, "minute": mi, "task": task_prompt}
+
+    m = re.match(r"^once\s+(\d{1,2}):(\d{2})$", t)
+    if m:
+        h = int(m.group(1))
+        mi = int(m.group(2))
+        if 0 <= h <= 23 and 0 <= mi <= 59:
+            return {"type": "once", "hour": h, "minute": mi, "task": task_prompt}
+
+    m = re.match(r"^after\s+(\d+)\s+(minute|minutes|hour|hours)$", t)
+    if m:
+        n = int(m.group(1))
+        unit = m.group(2)
+        now = datetime.now()
+        target = now + (timedelta(minutes=n) if 'min' in unit else timedelta(hours=n))
+        return {"type": "once", "hour": target.hour, "minute": target.minute, "task": task_prompt}
+    return None
+
+
+def _is_allowed_update(update: Update) -> bool:
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    uid = update.effective_user.id if update.effective_user else None
+    return bool(ALLOWED_IDS & {chat_id, uid})
+
+
+async def _cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_allowed_update(update):
+        return
+    chat_id = update.effective_chat.id
+    uid = update.effective_user.id if update.effective_user else None
+    ws = _resolve_workspace(chat_id, uid)
+    ws_sf = ws["sessions_file"]
+    update_chat(chat_id, ws_sf, session_id="__new__", running=False)
+    cur_model = get_chat(chat_id, ws_sf).get("model", DEFAULT_MODEL)
+    await update.message.reply_text(
+        f"{E.OK} <b>New session queued</b>\n{E.BOT} <code>{html.escape(cur_model)}</code>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def _cmd_send_like(update: Update, context: ContextTypes.DEFAULT_TYPE, action: str):
+    if not _is_allowed_update(update):
+        return
+    if not context.args:
+        await update.message.reply_text(
+            f"{E.WARN} Usage: <code>/{action} &lt;file_or_glob&gt;</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    pattern = " ".join(context.args).strip()
+    await update.message.reply_text(
+        f"{E.WAIT} <i>{'Uploading to gdrive' if action == 'upload' else 'Fetching file(s)'}...</i>",
+        parse_mode=ParseMode.HTML,
+    )
+    await _process_file_request(update, action, pattern)
+
+
+async def _cmd_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _cmd_send_like(update, context, "send")
+
+
+async def _cmd_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _cmd_send_like(update, context, "upload")
+
+
+async def _cmd_kill(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_allowed_update(update):
+        return
+    chat_id = update.effective_chat.id
+    uid = update.effective_user.id if update.effective_user else None
+    ws = _resolve_workspace(chat_id, uid)
+    ws_sf = ws["sessions_file"]
+    update_chat(chat_id, ws_sf, kill_requested="yes", running=False)
+    await update.message.reply_text(f"{E.OK} Kill signal sent. Running process will terminate.")
+
+
+async def _cmd_q(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # /q as quick quit (same as /kill)
+    await _cmd_kill(update, context)
+
+
+async def _opencode_stats_summary(days: int = 7) -> dict:
+    """Best-effort parse of `opencode stats` output into key metrics."""
+    script = f"{_safe_path(OPENCODE)} stats --days {int(days)} --models 5"
+    if CONNECTION_MODE in ("wsl", "local"):
+        cmd = ["bash", "-lc", script]
+    else:
+        cmd = _ssh_base() + ["bash", "-lc", script]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        raw, _ = await asyncio.wait_for(proc.communicate(), 20)
+        clean = ANSI_RE.sub("", raw.decode(errors="replace"))
+        pats = {
+            "sessions": r"^\s*Sessions\s+([0-9.,KMB]+)\s*$",
+            "messages": r"^\s*Messages\s+([0-9.,KMB]+)\s*$",
+            "input": r"^\s*Input\s+([0-9.,KMB]+)\s*$",
+            "output": r"^\s*Output\s+([0-9.,KMB]+)\s*$",
+            "cache_read": r"^\s*Cache Read\s+([0-9.,KMB]+)\s*$",
+            "cache_write": r"^\s*Cache Write\s+([0-9.,KMB]+)\s*$",
+            "avg_tokens_session": r"^\s*Avg Tokens/Session\s+([0-9.,KMB]+)\s*$",
+            "total_cost": r"^\s*Total Cost\s+\$?([0-9.,]+)\s*$",
+        }
+        out = {}
+        for k, pat in pats.items():
+            m = re.search(pat, clean, re.MULTILINE)
+            if m:
+                out[k] = m.group(1)
+        mm = re.search(r"^\s*([a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+)\s*$", clean, re.MULTILINE)
+        if mm:
+            out["top_model"] = mm.group(1)
+        return out
+    except Exception as e:
+        print(f"  [_opencode_stats_summary error: {e}]")
+        return {}
+
+
+async def _cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_allowed_update(update):
+        return
+    chat_id = update.effective_chat.id
+    uid = update.effective_user.id if update.effective_user else None
+    ws = _resolve_workspace(chat_id, uid)
+    ws_sf = ws["sessions_file"]
+    msg = await update.message.reply_text(f"{E.WAIT} Loading model providers...")
+    models = await _list_available_models()
+    await _delete_or_check(msg)
+    if not models:
+        await update.message.reply_text(f"{E.ERR} Failed to load model list.")
+        return
+    update_chat(chat_id, ws_sf, model_catalog=models)
+    grouped = _models_by_provider(models)
+    buttons = [[InlineKeyboardButton(f"{prov} ({len(ms)})", callback_data=f"mdlprov:{prov}")] for prov, ms in grouped.items()]
+    await update.message.reply_text(
+        f"{E.BOT} <b>Select provider</b>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def _cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_allowed_update(update):
+        return
+    chat_id = update.effective_chat.id
+    uid = update.effective_user.id if update.effective_user else None
+    ws = _resolve_workspace(chat_id, uid)
+    ws_sf = ws["sessions_file"]
+    chat = get_chat(chat_id, ws_sf)
+    if context.args:
+        req_sid = context.args[0].strip()
+        if not req_sid.startswith("ses_"):
+            await update.message.reply_text(
+                f"{E.ERR} <b>Invalid session ID:</b> <code>{html.escape(req_sid)}</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        status_msg = await update.message.reply_text(f"{E.WAIT} Checking session on HPC...")
+        exists = await _is_valid_session(req_sid)
+        await _delete_or_check(status_msg)
+        if not exists:
+            await update.message.reply_text(
+                f"{E.ERR} <b>Session not found:</b> <code>{html.escape(req_sid)}</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        update_chat(chat_id, ws_sf, session_id=req_sid)
+        await update.message.reply_text(
+            f"{E.OK} <b>Session</b> <code>{html.escape(req_sid)}</code>\n{E.BOT} <code>{html.escape(chat.get('model', DEFAULT_MODEL))}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # no id passed: show recent sessions for quick pick
+    sessions = await _fetch_hpc_sessions()
+    if not sessions:
+        await update.message.reply_text(
+            f"{E.WARN} No recent sessions found.\nUse <code>/new</code> to start one.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    buttons = []
+    for sid, title in sessions[:12]:
+        label = (title or sid)[:40]
+        buttons.append([InlineKeyboardButton(label, callback_data=f"sidset:{sid}")])
+    await update.message.reply_text(
+        f"{E.SESS} <b>Select a recent session</b>\nCurrent: <code>{html.escape(_display_sid(chat.get('session_id')))}</code>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def _on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_allowed_update(update):
+        return
+    q = update.callback_query
+    await q.answer()
+    chat_id = q.message.chat_id
+    uid = q.from_user.id if q.from_user else None
+    ws = _resolve_workspace(chat_id, uid)
+    ws_sf = ws["sessions_file"]
+    ws_tf = ws["tasks_file"]
+    data = q.data or ""
+
+    if data.startswith("mdlprov:"):
+        provider = data.split(":", 1)[1]
+        models = get_chat(chat_id, ws_sf).get("model_catalog") or []
+        grouped = _models_by_provider(models)
+        options = grouped.get(provider, [])
+        if not options:
+            await q.edit_message_text(f"{E.ERR} Provider has no models.")
+            return
+        cur_model = get_chat(chat_id, ws_sf).get("model", DEFAULT_MODEL)
+        rows = []
+        for m in options:
+            name = m.split('/', 1)[1]
+            label = ("✅ " + name) if m == cur_model else name
+            rows.append([InlineKeyboardButton(label, callback_data=f"mdlset:{m}")])
+        rows.append([InlineKeyboardButton("⬅️ Back", callback_data="mdlback")])
+        await q.edit_message_text(
+            f"{E.BOT} <b>{html.escape(provider)}</b> — select model", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows)
+        )
+        return
+
+    if data == "mdlback":
+        models = get_chat(chat_id, ws_sf).get("model_catalog") or []
+        grouped = _models_by_provider(models)
+        buttons = [[InlineKeyboardButton(f"{prov} ({len(ms)})", callback_data=f"mdlprov:{prov}")] for prov, ms in grouped.items()]
+        await q.edit_message_text(
+            f"{E.BOT} <b>Select provider</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+
+    if data.startswith("mdlset:"):
+        model = data.split(":", 1)[1]
+        update_chat(chat_id, ws_sf, model=model)
+        await q.edit_message_text(
+            f"{E.OK} <b>Model switched</b>\n{E.BOT} <code>{html.escape(model)}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if data.startswith("sidset:"):
+        sid = data.split(":", 1)[1]
+        update_chat(chat_id, ws_sf, session_id=sid)
+        await q.edit_message_text(
+            f"{E.OK} <b>Session switched</b>\n{E.SESS} <code>{html.escape(sid)}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if data == "schL":
+        await _render_schedule_list(chat_id, q, ws_tf)
+        return
+
+    if data.startswith("schs:"):
+        tid = data.split(":", 1)[1]
+        await _render_schedule_detail(q, tid, ws_tf)
+        return
+
+    if data.startswith("schd:"):
+        tid = data.split(":", 1)[1]
+        tf, tasks = _find_task_file(tid, ws_tf)
+        if tid in tasks:
+            del tasks[tid]
+            _save_scheduled_tasks(tasks, tf)
+            _reschedule_all_tasks(tasks)
+            await q.edit_message_text(f"{E.OK} Deleted <code>{html.escape(tid)}</code>", parse_mode=ParseMode.HTML)
+        else:
+            await q.edit_message_text(f"{E.ERR} Task not found.")
+        return
+
+    if data.startswith("sche:"):
+        tid = data.split(":", 1)[1]
+        await _render_schedule_edit_menu(q, tid, ws_tf)
+        return
+
+    if data.startswith("schef:"):
+        parts = data.split(":", 2)
+        if len(parts) < 3:
+            await q.edit_message_text(f"{E.ERR} Invalid edit action")
+            return
+        tid, field = parts[1], parts[2]
+        update_chat(chat_id, ws_sf, pending_edit={"type": "schedule", "task_id": tid, "field": field})
+        if field == "time":
+            hint = "Send new time format, e.g. `every 2 hours` / `daily 09:30` / `at 18:00` / `after 30 minutes`"
+        elif field == "name":
+            hint = "Send new task name text."
+        else:
+            hint = "Send new task content/prompt text."
+        await q.edit_message_text(
+            f"{E.WAIT} <b>Waiting for new {html.escape(field)}...</b>\n{hint}\n\nThis will overwrite the original value.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data=f"schs:{tid}")]]),
+        )
+        return
+
+    if data.startswith("schu:"):
+        parts = data.split(":")
+        # schu:<tid>:<mode>:<a>:<b>
+        if len(parts) < 5:
+            await q.edit_message_text(f"{E.ERR} Invalid edit payload")
+            return
+        tid, mode, a, b = parts[1], parts[2], parts[3], parts[4]
+        tf, tasks = _find_task_file(tid, ws_tf)
+        info = tasks.get(tid)
+        if not info:
+            await q.edit_message_text(f"{E.ERR} Task not found.")
+            return
+
+        if mode == "i":
+            info["schedule"] = {"type": "interval", "interval": int(a), "unit": b, "task": info.get("task", "")}
+        elif mode == "d":
+            info["schedule"] = {"type": "daily", "hour": int(a), "minute": int(b), "task": info.get("task", "")}
+        elif mode == "o":
+            now = datetime.now()
+            delta = timedelta(minutes=int(a)) if b == "minutes" else timedelta(hours=int(a))
+            target = now + delta
+            info["schedule"] = {"type": "once", "hour": target.hour, "minute": target.minute, "task": info.get("task", "")}
+        else:
+            await q.edit_message_text(f"{E.ERR} Unknown edit mode")
+            return
+
+        tasks[tid] = info
+        _save_scheduled_tasks(tasks, tf)
+        _reschedule_all_tasks(tasks)
+        await _render_schedule_detail(q, tid, ws_tf)
+        return
+
+
+def _schedule_desc(info: dict) -> str:
+    sched = (info or {}).get("schedule", {})
+    t = sched.get("type")
+    if t in ("once", "daily"):
+        h = int(sched.get("hour", 0))
+        m = int(sched.get("minute", 0))
+        if t == "daily":
+            return f"daily at {h:02d}:{m:02d}"
+        return f"once at {h:02d}:{m:02d}"
+    interval = int(sched.get("interval", 1))
+    unit = sched.get("unit", "minutes")
+    return f"every {interval} {unit}"
+
+
+def _task_label(task_id: str, info: dict) -> str:
+    desc = _schedule_desc(info)
+    name = (info.get("name", "") or "").strip()
+    task_preview = (info.get("task", "") or "").strip()
+    label = name if name else task_preview
+    if not label:
+        label = task_id
+    # Keep Telegram button label compact
+    label = label[:28]
+    return f"{label} · {desc}"
+
+
+async def _render_schedule_list(chat_id: int, message_obj, ws_tf):
+    task_map = _collect_chat_tasks(chat_id, ws_tf)
+    rows = []
+    if task_map:
+        for tid, pair in list(task_map.items())[:20]:
+            info, _tf = pair
+            rows.append([InlineKeyboardButton(_task_label(tid, info), callback_data=f"schs:{tid}")])
+    rows.append([InlineKeyboardButton("Refresh", callback_data="schL")])
+
+    text = (
+        f"{E.TIME} <b>Scheduled tasks</b>\nTap one to edit/delete."
+        if task_map
+        else f"{E.WARN} No scheduled tasks."
+    )
+
+    # CallbackQuery path (edit existing panel first)
+    if hasattr(message_obj, 'data'):
+        try:
+            await message_obj.edit_text(
+                text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup(rows),
+            )
+            return
+        except Exception as e:
+            # Fallback: send a new message to chat
+            try:
+                await message_obj.message.reply_text(
+                    text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup(rows),
+                )
+                return
+            except Exception:
+                print(f"  [_render_schedule_list callback fallback failed: {e}]")
+                return
+
+    # Normal Message path (/scheduled command)
+    await message_obj.reply_text(
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+async def _cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_allowed_update(update):
+        return
+    chat_id = update.effective_chat.id
+    uid = update.effective_user.id if update.effective_user else None
+    ws = _resolve_workspace(chat_id, uid)
+    await _render_schedule_list(chat_id, update.message, ws["tasks_file"])
+
+
+async def _render_schedule_detail(q, task_id: str, ws_tf):
+    tf, tasks = _find_task_file(task_id, ws_tf)
+    info = tasks.get(task_id)
+    if not info:
+        await q.edit_message_text(f"{E.ERR} Task not found: <code>{html.escape(task_id)}</code>", parse_mode=ParseMode.HTML)
+        return
+    desc = _schedule_desc(info)
+    task_name = html.escape((info.get("name", "") or "(no name)")[:120])
+    task_text = html.escape((info.get("task", "") or "")[:200])
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🗑 Delete", callback_data=f"schd:{task_id}"), InlineKeyboardButton("✏️ Edit", callback_data=f"sche:{task_id}")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="schL")],
+    ])
+    await q.edit_message_text(
+        f"{E.TIME} <b>Task</b> <code>{html.escape(task_id)}</code>\n"
+        f"Name: <b>{task_name}</b>\n"
+        f"Schedule: <b>{html.escape(desc)}</b>\n"
+        f"Prompt: <code>{task_text}</code>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb,
+    )
+
+
+async def _render_schedule_edit_menu(q, task_id: str, ws_tf):
+    tf, tasks = _find_task_file(task_id, ws_tf)
+    if task_id not in tasks:
+        await q.edit_message_text(f"{E.ERR} Task not found.")
+        return
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Edit name", callback_data=f"schef:{task_id}:name")],
+        [InlineKeyboardButton("Edit time", callback_data=f"schef:{task_id}:time")],
+        [InlineKeyboardButton("Edit content", callback_data=f"schef:{task_id}:task")],
+        [InlineKeyboardButton("⬅️ Back", callback_data=f"schs:{task_id}")],
+    ])
+    await q.edit_message_text(
+        f"{E.TOOL} <b>Edit task</b>\nChoose what to edit:",
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb,
+    )
+
+
+def _reschedule_all_tasks(tasks: Optional[Dict] = None):
+    schedule.clear()
+    all_task_files = {TASKS_FILE}
+    for _cid, ws_cfg in CHANNEL_WORKSPACES.items():
+        n = ws_cfg.get("name")
+        if n:
+            all_task_files.add(str(SCRIPT_DIR / f"hpc_relay_tasks_{n}.json"))
+    if AUTO_WORKSPACE_PER_CHAT:
+        for tf in SCRIPT_DIR.glob(f"hpc_relay_tasks_{AUTO_WORKSPACE_PREFIX}_*.json"):
+            all_task_files.add(str(tf))
+    for tf in all_task_files:
+        for tid, tinfo in _load_scheduled_tasks(tf).items():
+            tinfo.setdefault("tasks_file", tf)
+            _schedule_job(tid, tinfo)
+
+
+async def _cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_allowed_update(update):
+        return
+    chat_id = update.effective_chat.id
+    uid = update.effective_user.id if update.effective_user else None
+    ws = _resolve_workspace(chat_id, uid)
+    ws_sf = ws["sessions_file"]
+    ws_tf = ws["tasks_file"]
+    ws_wd = ws["workdir"]
+    ws_name = ws.get("name") or "default"
+    chat = get_chat(chat_id, ws_sf)
+    model = chat.get("model", DEFAULT_MODEL)
+    sid = _display_sid(chat.get("session_id"))
+    known = len(_get_known_sessions(ws_sf))
+    tasks = len(_load_scheduled_tasks(ws_tf))
+
+    pending = chat.get("pending_edit")
+    if pending:
+        pending_txt = f"active ({pending.get('task_id','?')} / {pending.get('field','?')})"
+    else:
+        pending_txt = "none"
+
+    wait = await update.message.reply_text(f"{E.WAIT} Gathering status...")
+    stats = await _opencode_stats_summary(days=7)
+    await _delete_or_check(wait)
+
+    lines = [
+        "📌 <b>Relay Status</b>",
+        f"🤖 <b>Model ID:</b> <code>{html.escape(model)}</code>",
+    ]
+
+    # Hide empty session from status output
+    if sid and sid != "new session" and sid.lower() != "none":
+        lines.append(f"🧵 <b>Session ID:</b> <code>{html.escape(sid)}</code>")
+
+    lines += [
+        f"🧩 <b>Workspace:</b> <code>{html.escape(ws_name)}</code>",
+        f"📁 <b>Workdir:</b> <code>{html.escape(ws_wd)}</code>",
+        f"🗂 <b>Known Sessions:</b> <code>{known}</code>",
+        f"⏰ <b>Scheduled Tasks:</b> <code>{tasks}</code>",
+        f"📝 <b>Pending edit:</b> <code>{html.escape(pending_txt)}</code>",
+    ]
+
+    if stats:
+        lines += [
+            "",
+            "📊 <b>OpenCode Stats (7d)</b>",
+            f"• Sessions: <code>{html.escape(stats.get('sessions','?'))}</code> | Messages: <code>{html.escape(stats.get('messages','?'))}</code>",
+            f"• Input: <code>{html.escape(stats.get('input','?'))}</code> | Output: <code>{html.escape(stats.get('output','?'))}</code>",
+            f"• Cache R/W: <code>{html.escape(stats.get('cache_read','?'))}</code> / <code>{html.escape(stats.get('cache_write','?'))}</code>",
+            f"• Avg tokens/session: <code>{html.escape(stats.get('avg_tokens_session','?'))}</code>",
+            f"• Total cost: <code>${html.escape(stats.get('total_cost','0.00'))}</code>",
+        ]
+        if stats.get("top_model"):
+            lines.append(f"• Top model: <code>{html.escape(stats['top_model'])}</code>")
+
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
 # ================================================================
 #  MAIN HANDLER
 # ================================================================
+async def _cmd_debugws(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_allowed_update(update):
+        return
+    chat_id = update.effective_chat.id
+    uid = update.effective_user.id if update.effective_user else None
+    ws = _resolve_workspace(chat_id, uid)
+    ws_sf = ws["sessions_file"]
+    ws_tf = ws["tasks_file"]
+    ws_wd = ws["workdir"]
+    ws_name = ws.get("name") or "default"
+    chat = get_chat(chat_id, ws_sf)
+    text = (
+        "🧪 <b>Workspace Debug</b>\n"
+        f"chat_id: <code>{chat_id}</code>\n"
+        f"user_id: <code>{uid}</code>\n"
+        f"workspace: <code>{html.escape(ws_name)}</code>\n"
+        f"workdir: <code>{html.escape(ws_wd)}</code>\n"
+        f"sessions_file: <code>{html.escape(ws_sf)}</code>\n"
+        f"tasks_file: <code>{html.escape(ws_tf)}</code>\n"
+        f"model: <code>{html.escape(chat.get('model', DEFAULT_MODEL))}</code>\n"
+        f"session_id: <code>{html.escape(str(chat.get('session_id')))}</code>\n"
+        f"scheduled_count: <code>{len(_load_scheduled_tasks(ws_tf))}</code>\n"
+        f"scheduled_count_chat_any_file: <code>{len(_collect_chat_tasks(chat_id, ws_tf))}</code>"
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     uid = update.effective_user.id if update.effective_user else None
@@ -1497,9 +2324,57 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not (ALLOWED_IDS & {chat_id, uid}):
         return
 
-    raw = (update.message.text or "").strip()
-    if not raw:
+    # Resolve workspace for this chat
+    ws = _resolve_workspace(chat_id, uid)
+    ws_sf = ws["sessions_file"]
+    if ws["allowed_users"] and uid not in ws["allowed_users"]:
+        print(f"  BLOCKED: user {uid} not in workspace allowed_users")
         return
+
+    raw, attached_files = await _extract_user_prompt_and_files(update, context, chat_id)
+    if not raw and not attached_files:
+        return
+    if attached_files and not raw:
+        raw = "Please analyze the attached image."
+
+    # normalize plain schedule keyword
+    if (raw or "").strip().lower() == "schedule":
+        raw = "scheduled"
+
+    # pending interactive edits (e.g. /schedule -> Edit -> send new value)
+    chat_state = get_chat(chat_id, ws_sf)
+    pending = chat_state.get("pending_edit")
+    if pending and raw and not raw.startswith("/"):
+        if pending.get("type") == "schedule":
+            task_id = pending.get("task_id")
+            field = pending.get("field")
+            tf, tasks = _find_task_file(task_id, ws_tf)
+            info = tasks.get(task_id)
+            if not info:
+                update_chat(chat_id, ws_sf, pending_edit={})
+                await update.message.reply_text(f"{E.ERR} Task not found anymore.")
+                return
+            if field == "time":
+                parsed = _parse_schedule_text(raw, info.get("task", ""))
+                if not parsed:
+                    await update.message.reply_text(
+                        f"{E.ERR} Invalid time format. Try: `every 2 hours` / `daily 09:30` / `at 18:00` / `after 30 minutes`"
+                    )
+                    return
+                info["schedule"] = parsed
+            elif field == "name":
+                info["name"] = raw.strip()
+            else:
+                info["task"] = raw.strip()
+                # keep schedule.task in sync for older codepaths
+                if isinstance(info.get("schedule"), dict):
+                    info["schedule"]["task"] = raw.strip()
+            tasks[task_id] = info
+            _save_scheduled_tasks(tasks, tf)
+            _reschedule_all_tasks(tasks)
+            update_chat(chat_id, ws_sf, pending_edit={})
+            await update.message.reply_text(f"{E.OK} Updated <code>{html.escape(task_id)}</code> ({html.escape(field)} overwritten).", parse_mode=ParseMode.HTML)
+            return
 
     # Check mention
     if raw.startswith("@"):
@@ -1517,8 +2392,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
     # Fast-path kill command without backgrounding
-    if raw.lower() == "!kill" or "@@kill@@" in raw.lower():
-        update_chat(chat_id, kill_requested="yes")
+    if raw.lower() in ("!kill", "/kill", "/q"):
+        update_chat(chat_id, ws_sf, kill_requested="yes", running=False)
         try:
             await update.message.reply_text(
                 f"{E.OK} Kill signal sent. Running processes will terminate."
@@ -1527,14 +2402,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         return
 
+    # Prevent concurrent opencode runs in the same chat (avoids DB/session lock errors)
+    chat_now = get_chat(chat_id, ws_sf)
+    if chat_now.get("running"):
+        try:
+            await update.message.reply_text(
+                f"{E.WARN} 上一个任务还在运行中（之前可能已发 partial）。\n"
+                f"请等它结束，或发 <code>/kill</code> 终止后再发下一条。",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+        return
+
     # Dispatch to background task so the bot immediately accepts new messages
-    # (like @@kill@@)
-    asyncio.create_task(_run_in_background(update, context, chat_id, raw))
+    asyncio.create_task(_run_in_background(update, context, chat_id, raw, ws, attached_files))
 
 
-async def _run_in_background(update, context, chat_id, raw):
+async def _run_in_background(update, context, chat_id, raw, ws, attached_files=None):
+    update_chat(chat_id, ws["sessions_file"], running=True, running_started=int(time.time()), running_prompt=(raw or "")[:120])
     try:
-        await _handle_message_inner(update, context, chat_id, raw)
+        await _handle_message_inner(update, context, chat_id, raw, ws, attached_files)
     except Exception as exc:
         tb = traceback.format_exc()
         print(f"  UNHANDLED ERROR:\n{tb}")
@@ -1544,175 +2432,31 @@ async def _run_in_background(update, context, chat_id, raw):
             )
         except Exception:
             pass
+    finally:
+        update_chat(chat_id, ws["sessions_file"], running=False, running_started=0, running_prompt="")
 
 
-async def _handle_message_inner(update, context, chat_id, raw):
-    # -- SCHEDULED TASK LIST --
-    if re.match(r"(?i)^@@scheduled?:@@$", raw.strip()):
-        tasks = _load_scheduled_tasks()
-        if not tasks:
-            await update.message.reply_text(
-                f"{E.WARN} No scheduled tasks.",
-                parse_mode=ParseMode.HTML,
-            )
-        else:
-            lines = []
-            for task_id, info in tasks.items():
-                sched = info.get("schedule", {})
-                if sched.get("type") in ("once", "daily"):
-                    hour = sched.get("hour", 0)
-                    minute = sched.get("minute", 0)
-                    sched_str = f"at {hour:02d}:{minute:02d}"
-                    if sched.get("type") == "daily":
-                        sched_str = f"daily {sched_str}"
-                    else:
-                        sched_str = f"once {sched_str}"
-                else:
-                    interval = sched.get("interval", 1)
-                    unit = sched.get("unit", "minutes")
-                    sched_str = f"every {interval} {unit}"
-
-                task_preview = info.get("task", "")[:40]
-                lines.append(
-                    f"  <code>{task_id}</code> {sched_str}\n    {html.escape(task_preview)}"
-                )
-
-            await update.message.reply_text(
-                f"{E.OK} <b>Scheduled Tasks:</b>\n\n"
-                + "\n\n".join(lines)
-                + "\n\n<i>Cancel task:</i> <code>@@unschedule: task_id@@</code>",
-                parse_mode=ParseMode.HTML,
-            )
-        return
-
-    # -- UNSCHEDULE TASK --
-    m_un = re.match(r"(?i)^@@unschedule:\s*(.+?)@@$", raw.strip())
-    if m_un:
-        target_id = m_un.group(1).strip()
-        tasks = _load_scheduled_tasks()
-        if target_id in tasks:
-            del tasks[target_id]
-            _save_scheduled_tasks(tasks)
-            schedule.clear()
-            for tid, tinfo in tasks.items():
-                _schedule_job(tid, tinfo)
-            await update.message.reply_text(
-                f"{E.OK} Scheduled task <code>{html.escape(target_id)}</code> deleted.",
-                parse_mode=ParseMode.HTML,
-            )
-        else:
-            await update.message.reply_text(
-                f"{E.ERR} Task ID <code>{html.escape(target_id)}</code> not found.",
-                parse_mode=ParseMode.HTML,
-            )
-        return
-
-    # -- MANUAL FILE FETCH --
-    m_send = re.match(r"(?i)^@@(send|upload):\s*(.+?)(?:@@)?$", raw.strip())
-    if m_send:
-        action = m_send.group(1).lower()
-        await update.message.reply_text(
-            f"{E.WAIT} <i>{'Uploading to gdrive' if action == 'upload' else 'Fetching file(s)'}...</i>",
-            parse_mode=ParseMode.HTML,
-        )
-        await _process_file_request(update, action, m_send.group(2))
-        return
+async def _handle_message_inner(update, context, chat_id, raw, ws, attached_files=None):
+    ws_tf = ws["tasks_file"]
+    ws_sf = ws["sessions_file"]
+    ws_wd = ws["workdir"]
+    ws_suffix = ws["system_suffix"]
+    ws_name = ws.get("name") or "default"
+    print(f"  workspace={ws_name}  workdir={ws_wd}")
+    # Scheduled management is handled via /scheduled command.
 
     parsed = parse_message(raw)
-    chat = get_chat(chat_id)
-    model = parsed["model"] or chat["model"]
+    chat = get_chat(chat_id, ws_sf)
+    model = chat["model"]
     sid = chat["session_id"]
     print(f"  model={model}  session={sid}")
-
-    # -- MODEL-ONLY --
-    if (
-        parsed["model"]
-        and not parsed["prompt"]
-        and not parsed["session"]
-        and not parsed["shell"]
-    ):
-        requested = parsed["model"]
-        if requested not in KNOWN_MODELS and not requested.startswith(
-            ("opencode/", "github-copilot/")
-        ):
-            lines = []
-            for alias in sorted(MODEL_ALIASES.keys()):
-                full = MODEL_ALIASES[alias]
-                lines.append(f"  <code>{alias:8s}</code> {html.escape(full)}")
-            table = "\n".join(lines)
-            await update.message.reply_text(
-                f"{E.ERR} <b>Unknown model:</b> <code>{html.escape(requested)}</code>\n\n"
-                f"<b>Available models (alias \u2192 full name):</b>\n{table}\n\n"
-                f"Or use full name: <code>github-copilot/model-name</code>",
-                parse_mode=ParseMode.HTML,
-            )
-            return
-        update_chat(chat_id, model=requested)
-        await update.message.reply_text(
-            f"{E.OK} <b>Model</b> <code>{html.escape(requested)}</code>\n"
-            f"{E.SESS} <code>{_display_sid(sid)}</code>",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
-    # -- SESSION-ONLY --
-    if parsed["session"] and not parsed["prompt"] and not parsed["shell"]:
-        if parsed["session"] == "new":
-            update_chat(chat_id, session_id="__new__")
-            txt = f"{E.OK} <b>New session queued</b>\n{E.BOT} <code>{html.escape(model)}</code>"
-        else:
-            req_sid = parsed["session"]
-            if not req_sid.startswith("ses_"):
-                hpc_sessions = await _fetch_hpc_sessions()
-                if hpc_sessions:
-                    known_str = "\n".join(
-                        f"  <code>{s[0][:25]}</code> {html.escape((s[1] or 'Untitled')[:30])}"
-                        for s in hpc_sessions[:10]
-                    )
-                else:
-                    known_str = "  (none found)"
-                await update.message.reply_text(
-                    f"{E.ERR} <b>Invalid session ID:</b> <code>{html.escape(req_sid)}</code>\n"
-                    f"Session IDs must start with <code>ses_</code>\n\n"
-                    f"<b>Current session:</b> <code>{sid or 'None'}</code>\n\n"
-                    f"<b>Recent sessions on HPC:</b>\n{known_str}\n\n"
-                    f"Use <code>@@session: new@@</code> for a new session.",
-                    parse_mode=ParseMode.HTML,
-                )
-                return
-            status_msg = await update.message.reply_text(
-                f"{E.WAIT} Checking session on HPC..."
-            )
-            exists = await _is_valid_session(req_sid)
-            await _delete_or_check(status_msg)
-            if not exists:
-                hpc_sessions = await _fetch_hpc_sessions()
-                if hpc_sessions:
-                    known_str = "\n".join(
-                        f"  <code>{s[0][:25]}</code> {html.escape((s[1] or 'Untitled')[:30])}"
-                        for s in hpc_sessions[:10]
-                    )
-                else:
-                    known_str = "  (none found)"
-                await update.message.reply_text(
-                    f"{E.ERR} <b>Session not found:</b> <code>{html.escape(req_sid)}</code>\n\n"
-                    f"<b>Current session:</b> <code>{sid or 'None'}</code>\n\n"
-                    f"<b>Recent sessions on HPC:</b>\n{known_str}\n\n"
-                    f"Use <code>@@session: new@@</code> for a new session.",
-                    parse_mode=ParseMode.HTML,
-                )
-                return
-            update_chat(chat_id, session_id=req_sid)
-            txt = f"{E.OK} <b>Session</b> <code>{html.escape(req_sid)}</code>\n{E.BOT} <code>{html.escape(model)}</code>"
-        await update.message.reply_text(txt, parse_mode=ParseMode.HTML)
-        return
 
     # -- SHELL --
     if parsed["shell"]:
         print(f"  SHELL:{parsed['shell']}")
         status_msg = await update.message.reply_text(f"{E.SHELL} Running...")
         try:
-            out = await exec_shell(parsed["shell"])
+            out = await exec_shell(parsed["shell"], ws_wd)
         except asyncio.TimeoutError:
             out = f"{E.TIME} Timed out after {LOCAL_TIMEOUT_SEC}s."
         except Exception as e:
@@ -1724,26 +2468,18 @@ async def _handle_message_inner(update, context, chat_id, raw):
         return
 
     # -- OPENCODE --
-    if parsed["model"]:
-        update_chat(chat_id, model=model)
-    effective_sid = sid
-    if parsed["session"]:
-        if parsed["session"] == "new":
-            effective_sid = None
-            update_chat(chat_id, session_id="__new__")
-        else:
-            effective_sid = parsed["session"]
-            update_chat(chat_id, session_id=effective_sid)
-    if effective_sid == "__new__":
-        effective_sid = None
+    effective_sid = None if sid == "__new__" else sid
 
     # Clear any previous kill flag
-    update_chat(chat_id, kill_requested="no")
+    update_chat(chat_id, ws_sf, kill_requested="no")
 
-    prompt = parsed["prompt"] + SYSTEM_SUFFIX
-    status_msg = await update.message.reply_text(
-        f"{E.WAIT} Connecting to HPC..."
-    )
+    if not parsed.get("prompt"):
+        return
+    prompt = parsed["prompt"] + ws_suffix
+    status_label = f"{E.WAIT} Connecting to HPC..."
+    if attached_files:
+        status_label += f"\nAttached image(s): {len(attached_files)}"
+    status_msg = await update.message.reply_text(status_label)
 
     text_buf = []
     last_edit_t = 0.0
@@ -1796,7 +2532,7 @@ async def _handle_message_inner(update, context, chat_id, raw):
                 if text_buf and partial_sent_len == 0:
                     joined = "".join(text_buf)
                     partial_sent_len = len(joined)
-                    cur_sid = get_chat(chat_id).get("session_id")
+                    cur_sid = get_chat(chat_id, ws_sf).get("session_id")
                     hdr = _header_html(
                         model,
                         _display_sid(cur_sid, is_new=(effective_sid is None)),
@@ -1811,7 +2547,7 @@ async def _handle_message_inner(update, context, chat_id, raw):
                 await _safe_edit(
                     status_msg,
                     f"{E.WARN} Running {elapsed}s | buf {chars} chars | silent {int(silence)}s\n"
-                    f"Send !kill to stop.",
+                    f"Send /kill to stop.",
                 )
                 continue
 
@@ -1823,7 +2559,7 @@ async def _handle_message_inner(update, context, chat_id, raw):
                 joined = "".join(text_buf)
                 if len(joined) > 50:
                     partial_sent_len = len(joined)
-                    cur_sid = get_chat(chat_id).get("session_id")
+                    cur_sid = get_chat(chat_id, ws_sf).get("session_id")
                     hdr = _header_html(
                         model,
                         _display_sid(cur_sid, is_new=(effective_sid is None)),
@@ -1841,7 +2577,7 @@ async def _handle_message_inner(update, context, chat_id, raw):
                     continue
             if silence >= STALL_WARN_SEC:
                 chars = len("".join(text_buf))
-                kill_hint = "\nSend !kill to stop."
+                kill_hint = "\nSend /kill to stop."
                 if partial_sent_len > 0:
                     st = f"{E.WARN} Silent {int(silence)}s (total: {elapsed}s)\nPartial sent ({partial_sent_len} chars){kill_hint}"
                 else:
@@ -1851,12 +2587,13 @@ async def _handle_message_inner(update, context, chat_id, raw):
     monitor = asyncio.create_task(stall_monitor())
     try:
         final, new_sid = await run_opencode(
-            prompt, chat_id, model, effective_sid, on_progress, on_text_chunk
+            prompt, chat_id, model, effective_sid, on_progress, on_text_chunk, attached_files,
+            workdir=ws_wd, sessions_file=ws_sf
         )
     except subprocess.TimeoutExpired:
         joined = "".join(text_buf)
         if joined.strip() and partial_sent_len == 0:
-            cur_sid = get_chat(chat_id).get("session_id")
+            cur_sid = get_chat(chat_id, ws_sf).get("session_id")
             hdr = _header_html(
                 model, _display_sid(cur_sid, is_new=(effective_sid is None))
             )
@@ -1876,7 +2613,7 @@ async def _handle_message_inner(update, context, chat_id, raw):
         print(f"  OPENCODE ERROR:\n{tb}")
         joined = "".join(text_buf)
         if joined.strip() and partial_sent_len == 0:
-            cur_sid = get_chat(chat_id).get("session_id")
+            cur_sid = get_chat(chat_id, ws_sf).get("session_id")
             hdr = _header_html(
                 model, _display_sid(cur_sid, is_new=(effective_sid is None))
             )
@@ -1901,7 +2638,12 @@ async def _handle_message_inner(update, context, chat_id, raw):
         except asyncio.CancelledError:
             pass
 
-    chat = get_chat(chat_id)
+    # Persist latest model used for this session so switching back restores model.
+    used_sid = new_sid or effective_sid
+    if isinstance(used_sid, str) and used_sid.startswith("ses"):
+        _set_session_model(used_sid, model, ws_sf)
+
+    chat = get_chat(chat_id, ws_sf)
     display_sid = chat.get("session_id") or new_sid
     if display_sid == "__new__":
         display_sid = new_sid
@@ -1916,12 +2658,7 @@ async def _handle_message_inner(update, context, chat_id, raw):
     if partial_sent_len > 0 and len(final) > partial_sent_len:
         remaining = final[partial_sent_len:]
         if remaining.strip():
-            final_msg = (
-                header
-                + f"<i>...continued ({elapsed}s)</i>\n\n"
-                + md_to_tg_html(remaining)
-                + f"\n\n{E.OK} <b>[Finished]</b>"
-            )
+            final_msg = md_to_tg_html(remaining)
         else:
             final_msg = (
                 header
@@ -1933,7 +2670,7 @@ async def _handle_message_inner(update, context, chat_id, raw):
             + f"\n\n{E.OK} <b>[Finished]</b> ({elapsed}s) \u2014 see partial above."
         )
     else:
-        final_msg = header + body_html + f"\n\n{E.OK} <b>[Finished]</b>"
+        final_msg = body_html
 
     # Process Scheduled tasks from AI response
     scheduled_tasks_to_add = re.findall(
@@ -1989,7 +2726,7 @@ async def _handle_message_inner(update, context, chat_id, raw):
 
             if task_info:
                 task_id = f"task_{int(time.time())}_{len(scheduled_hint)}"
-                tasks = _load_scheduled_tasks()
+                tasks = _load_scheduled_tasks(ws_tf)
                 tasks[task_id] = {
                     "schedule": task_info,
                     "task": task_info["task"],
@@ -1997,8 +2734,9 @@ async def _handle_message_inner(update, context, chat_id, raw):
                     "model": model,
                     "session_id": sid,
                     "created_at": datetime.now().isoformat(),
+                    "tasks_file": ws_tf,
                 }
-                _save_scheduled_tasks(tasks)
+                _save_scheduled_tasks(tasks, ws_tf)
                 _schedule_job(task_id, tasks[task_id])
 
                 if task_info["type"] == "interval":
@@ -2018,14 +2756,7 @@ async def _handle_message_inner(update, context, chat_id, raw):
     await _delete_or_check(status_msg)
 
     # Process AI file triggers unconditionally
-    files_to_send = re.findall(r"@@SEND_FILE:\s*(.+?)@@", final, re.IGNORECASE)
-    # Deduplicate while preserving order
-    seen_files = set()
-    unique_files = [
-        f.strip(" @")
-        for f in files_to_send
-        if not (f in seen_files or seen_files.add(f))
-    ]
+    unique_files = _extract_send_file_directives(final)
 
     # hard limit of 10 max automatic files to prevent catastrophic spam
     for f in unique_files[:10]:
@@ -2043,10 +2774,36 @@ def main():
 
     async def on_startup(app):
         set_app_context(app, asyncio.get_event_loop())
+        await app.bot.set_my_commands([
+            BotCommand("model", "Select model (provider -> model)"),
+            BotCommand("new", "Start a new session"),
+            BotCommand("id", "Switch to session id or pick recent"),
+            BotCommand("send", "Send file(s) from HPC/local workspace"),
+            BotCommand("upload", "Upload file(s) via rclone destination"),
+            BotCommand("status", "Show current model/session and runtime status"),
+            BotCommand("debugws", "Show workspace/session/task file mapping"),
+            BotCommand("scheduled", "Manage scheduled tasks (edit/delete)"),
+            BotCommand("kill", "Stop current running task"),
+            BotCommand("q", "Quick quit current task (same as /kill)"),
+        ])
 
     app.post_init = on_startup
+    app.add_handler(CommandHandler("model", _cmd_model))
+    app.add_handler(CommandHandler("new", _cmd_new))
+    app.add_handler(CommandHandler("id", _cmd_id))
+    app.add_handler(CommandHandler("send", _cmd_send))
+    app.add_handler(CommandHandler("upload", _cmd_upload))
+    app.add_handler(CommandHandler("status", _cmd_status))
+    app.add_handler(CommandHandler("debugws", _cmd_debugws))
+    app.add_handler(CommandHandler("scheduled", _cmd_schedule))
+    app.add_handler(CommandHandler("kill", _cmd_kill))
+    app.add_handler(CommandHandler("q", _cmd_q))
+    app.add_handler(CallbackQueryHandler(_on_callback_query))
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
+    )
+    app.add_handler(
+        MessageHandler((filters.PHOTO | filters.Document.IMAGE) & ~filters.COMMAND, handle_message)
     )
     print("Bot started -- polling...")
     app.run_polling()
