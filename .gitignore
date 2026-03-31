@@ -4,6 +4,7 @@
 .env.*
 !.env.example
 hpcrelay/
+*start*.sh*
 
 # Python
 __pycache__/
@@ -42,6 +43,9 @@ opencode_chat_viewer/
 # Session data
 *session*.json
 *task*.json
+inbox/
+run_traces/
+*.pid
 
 # Workspace data
 workspace*/

@@ -15,15 +15,30 @@ import subprocess
 import html
 import traceback
 import threading
+import signal
 import schedule
 from datetime import datetime, timedelta
 from typing import Optional, Tuple, List, Dict
 from pathlib import Path
+from faster_whisper import WhisperModel
+
 
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
-from telegram.ext import Application, MessageHandler, ContextTypes, CommandHandler, CallbackQueryHandler, filters
-from telegram.constants import ParseMode
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    BotCommand,
+)
+from telegram.ext import (
+    Application,
+    MessageHandler,
+    ContextTypes,
+    CommandHandler,
+    CallbackQueryHandler,
+    filters,
+)
+from telegram.constants import ParseMode, ChatAction
 
 # Load .env from the same directory as this script
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -217,7 +232,8 @@ def _md_to_tg_html_inner(text: str) -> str:
 
 
 # ================================================================
-#  CONFIG  (loaded from .env -- copy .env.example to .env and fill in your values)
+#  CONFIG  (loaded from .env -- copy .env.example to .env and fill in
+#  your values)
 # ================================================================
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ALLOWED_IDS = set()
@@ -245,7 +261,8 @@ RETRY_ON_TIMEOUT = True
 # Set SETUP_CMD in .env to whatever loads your dependencies.
 # Examples:
 #   Generic Lmod cluster:    module load nodejs
-#   Conda environment:       source ~/miniconda3/etc/profile.d/conda.sh && conda activate myenv
+#   Conda environment:
+#     source ~/miniconda3/etc/profile.d/conda.sh && conda activate myenv
 #   No modules needed:       (leave blank or omit)
 _setup_raw = os.environ.get(
     "SETUP_CMD", os.environ.get("HPC_SETUP_CMD", "")
@@ -270,6 +287,7 @@ STREAM_EDIT_INTERVAL = 1.5
 STREAM_MIN_DELTA = 80
 STALL_WARN_SEC = 45
 PARTIAL_SEND_SEC = 90
+STALE_RUNNING_SEC = int(os.environ.get("STALE_RUNNING_SEC", "900"))
 TIMEOUT_WARN_SEC = 420  # 7 min: first warning
 REMOTE_TIMEOUT_SEC = 1800  # 30 min max
 LOCAL_TIMEOUT_SEC = REMOTE_TIMEOUT_SEC + 30
@@ -281,23 +299,28 @@ OC_DB_PATH = os.environ.get(
 SYSTEM_SUFFIX = (
     " STYLE: Default to natural, human conversational replies in plain text."
 
-    " Only use heavy structure (headers/lists/code blocks) when it genuinely improves clarity"
-    " for technical or multi-step content. For simple questions, answer as a short normal paragraph."
-    " MEMORY BOOTSTRAP: At the beginning of each new task, read local files in current workdir in this order:"
-    " `./MEMORY.md` then `./AGENTS.md` (if present). If missing, create MEMORY.md in current workdir and continue."
-    " If reading fails or permissions reject, continue answering normally without stopping."
+    " Only use heavy structure (headers/lists/code blocks) when it"
+    " genuinely improves clarity for technical or multi-step content."
+    " For simple questions, answer as a short normal paragraph."
+    " MEMORY BOOTSTRAP: At the beginning of each new task, read local"
+    " files in current workdir in this order: `./MEMORY.md` then"
+    " `./AGENTS.md` (if present). If missing, create MEMORY.md in"
+    " current workdir and continue. If reading fails or permissions"
+    " reject, continue answering normally without stopping."
     " IMPORTANT: Headless / non-interactive mode (`opencode run`)."
     " Do NOT invoke ask_questions tool"
-    " If any tool call is denied/rejected, continue and provide the best possible direct answer instead of stopping."
-    " Avoid reading external directories unless the user explicitly asks. Prefer local workspace files first."
-    " Unless explicitly told not to by the user, automatically output "
-    "exactly `@@SEND_FILE: <filepath>@@` whenever you create or reference "
-    "a small output file (like a png, pdf, or short dataset)."
-    " If detect user intention to schedule a recurring or future task or "
-    "ask something to be performed later, output exactly "
-    "`@@SCHEDULE: <time_format> | <task_prompt>@@` anywhere in your "
-    "response. For <time_format>, use `every X minutes/hours/days`, "
-    "`at HH:MM`, or `after X minutes/hours`.")
+    " If any tool call is denied/rejected, continue and provide the"
+    " best possible direct answer instead of stopping. Avoid reading"
+    " external directories unless the user explicitly asks. Prefer"
+    " local workspace files first. Unless explicitly told not to by"
+    " the user, automatically output exactly `@@SEND_FILE: <filepath>@@`"
+    " whenever you create or reference a small output file (like a png,"
+    " pdf, or short dataset)."
+    " If detect user intention to schedule a recurring or future task or"
+    " ask something to be performed later, output exactly"
+    " `@@SCHEDULE: <time_format> | <task_prompt>@@` anywhere in your"
+    " response. For <time_format>, use `every X minutes/hours/days`,"
+    " `at HH:MM`, or `after X minutes/hours`.")
 
 SHELL_PREFIX = "!"
 
@@ -312,8 +335,16 @@ if _CW_RAW:
     except json.JSONDecodeError as _e:
         print(f"  [WARN] CHANNEL_WORKSPACES is invalid JSON: {_e}")
 
-AUTO_WORKSPACE_PER_CHAT = os.environ.get("AUTO_WORKSPACE_PER_CHAT", "0").strip().lower() in {"1", "true", "yes", "on"}
+AUTO_WORKSPACE_PER_CHAT = (
+    os.environ.get("AUTO_WORKSPACE_PER_CHAT", "0")
+    .strip().lower() in {"1", "true", "yes", "on"}
+)
 AUTO_WORKSPACE_PREFIX = os.environ.get("AUTO_WORKSPACE_PREFIX", "chat")
+
+
+WHISPER_MODEL_SIZE = os.environ.get("WHISPER_MODEL_SIZE", "small")
+WHISPER_DEVICE = os.environ.get("WHISPER_DEVICE", "auto")
+_WHISPER_MODEL = None
 
 
 def _resolve_workspace(chat_id: int, user_id: int = None) -> dict:
@@ -345,14 +376,28 @@ def _resolve_workspace(chat_id: int, user_id: int = None) -> dict:
         sfile = SESSIONS_FILE
     # Use workspace-specific suffix if available
     if name:
-        suffix = SYSTEM_SUFFIX + f" Your workspace / long-term memory directory is '{wdir}'. Read and write your persistent notes and schedule data from files in this directory."
+        suffix = (
+            SYSTEM_SUFFIX
+            + f" Your workspace / long-term memory directory is '{wdir}'."
+            " Read and write your persistent notes and schedule data from"
+            " files in this directory."
+        )
     else:
         suffix = SYSTEM_SUFFIX
-    return {"workdir": wdir, "name": name, "tasks_file": tfile, "sessions_file": sfile, "system_suffix": suffix, "allowed_users": allowed}
+    return {
+        "workdir": wdir,
+        "name": name,
+        "tasks_file": tfile,
+        "sessions_file": sfile,
+        "system_suffix": suffix,
+        "allowed_users": allowed,
+    }
 
 
 INBOX_DIR = SCRIPT_DIR / "inbox"
 INBOX_DIR.mkdir(exist_ok=True)
+RUN_TRACE_DIR = SCRIPT_DIR / "run_traces"
+RUN_TRACE_DIR.mkdir(exist_ok=True)
 
 ws_sf = SESSIONS_FILE
 ws_tf = TASKS_FILE
@@ -411,7 +456,7 @@ def _run_scheduled_task(task_id: str, task_info: dict):
                     text=(
                         f"{E.WAIT} <b>[Scheduled Task Started]</b>\n"
                         "Connecting to HPC...\n"
-                        f"<i>Task:{html.escape(task[:50])}...</i>"
+                        f"<i>Task: {html.escape(task[:50])}...</i>"
                     ),
                     parse_mode="HTML",
                 )
@@ -450,20 +495,40 @@ def _run_scheduled_task(task_id: str, task_info: dict):
             if status_msg:
                 await _safe_edit(
                     status_msg,
-                    f"{E.WAIT} [Scheduled] Streaming... [{int(now - start_t)}s]\n\n{tail}",
+                    f"{E.WAIT} [Scheduled] Streaming... "
+                    f"[{int(now - start_t)}s]\n\n{tail}",
                 )
 
         try:
             final, new_sid = await run_opencode(
-                prompt, chat_id, model, session_id, on_progress, on_text_chunk, workdir=ws_wd, sessions_file=ws_sf
+                prompt,
+                chat_id,
+                model,
+                session_id,
+                on_progress,
+                on_text_chunk,
+                workdir=ws_wd,
+                sessions_file=ws_sf,
             )
 
-            # If scheduled task points to a stale session (from another host/bot),
-            # auto-retry once with a fresh session instead of surfacing legacy guidance.
-            if isinstance(final, str) and "Session does not exist on this machine" in final:
-                await on_progress(f"{E.RETRY} Scheduled task session invalid; retrying with a new session...")
+            # If scheduled task points to a stale session
+            # (from another host/bot), auto-retry once with a fresh
+            # session instead of surfacing legacy guidance.
+            if (isinstance(final, str)
+                    and "Session does not exist on this machine" in final):
+                await on_progress(
+                    f"{E.RETRY} Scheduled task session invalid; "
+                    "retrying with a new session..."
+                )
                 final, new_sid = await run_opencode(
-                    prompt, chat_id, model, None, on_progress, on_text_chunk, workdir=ws_wd, sessions_file=ws_sf
+                    prompt,
+                    chat_id,
+                    model,
+                    None,
+                    on_progress,
+                    on_text_chunk,
+                    workdir=ws_wd,
+                    sessions_file=ws_sf,
                 )
         except Exception as e:
             final = f"{E.ERR} Task failed: {e}\n\n" + ("".join(text_buf))
@@ -532,7 +597,10 @@ def _run_scheduled_task(task_id: str, task_info: dict):
                                 }
 
                         if new_info:
-                            new_task_id = f"task_{int(time.time())}_{len(scheduled_hint)}"
+                            new_task_id = (
+                                f"task_{int(time.time())}_"
+                                f"{len(scheduled_hint)}"
+                            )
                             tasks = _load_scheduled_tasks(ws_tf)
                             tasks[new_task_id] = {
                                 "schedule": new_info,
@@ -549,11 +617,20 @@ def _run_scheduled_task(task_id: str, task_info: dict):
                             _schedule_job(new_task_id, tasks[new_task_id])
 
                             if new_info["type"] == "interval":
-                                desc = f"every {new_info['interval']} {new_info['unit']}"
+                                desc = (
+                                    f"every {new_info['interval']} "
+                                    f"{new_info['unit']}"
+                                )
                             elif new_info["type"] == "daily":
-                                desc = f"daily at {new_info['hour']:02d}:{new_info['minute']:02d}"
+                                desc = (
+                                    f"daily at {new_info['hour']:02d}:"
+                                    f"{new_info['minute']:02d}"
+                                )
                             else:
-                                desc = f"once at {new_info['hour']:02d}:{new_info['minute']:02d}"
+                                desc = (
+                                    f"once at {new_info['hour']:02d}:"
+                                    f"{new_info['minute']:02d}"
+                                )
 
                             scheduled_hint += (
                                 f"\n\n{E.OK} <b>Scheduled Task Added!</b>\n"
@@ -561,7 +638,7 @@ def _run_scheduled_task(task_id: str, task_info: dict):
                                 f"<code>{html.escape(task_prompt[:50])}</code>"
                             )
 
-                if status_msg:
+                if status_msg is not None:
                     await _delete_or_check(status_msg)
 
                 await _app.bot.send_message(
@@ -613,17 +690,19 @@ def _run_scheduled_task(task_id: str, task_info: dict):
                                 DummyUpdate(chat_id), "send", f
                             )
                         except Exception as file_exp:
-                            print(
-                                f"  [SCHEDULED TASK {task_id}] Error sending file:{file_exp}"
+                            msg = (
+                                f"  [SCHEDULED TASK {task_id}] "
+                                f"Error sending file: {file_exp}"
                             )
+                            print(msg)
 
             except Exception as e:
                 import traceback
 
-                traceback.print_exc()
                 print(
-                    f"  [SCHEDULED TASK {task_id}] Error sending message:{e}"
+                    f"  [SCHEDULED TASK {task_id}] Error sending message: {e}"
                 )
+                traceback.print_exc()
 
     if _loop:
         asyncio.run_coroutine_threadsafe(_execute(), _loop)
@@ -634,15 +713,19 @@ def _all_task_files() -> list:
     for _cid, ws_cfg in CHANNEL_WORKSPACES.items():
         n = ws_cfg.get("name")
         if n:
-            files.add(str(SCRIPT_DIR / f"hpc_relay_tasks_{n}.json"))
+            files.add(
+                str(SCRIPT_DIR / f"hpc_relay_tasks_{n}.json")
+            )
     if AUTO_WORKSPACE_PER_CHAT:
-        for tf in SCRIPT_DIR.glob(f"hpc_relay_tasks_{AUTO_WORKSPACE_PREFIX}_*.json"):
+        prefix = f"hpc_relay_tasks_{AUTO_WORKSPACE_PREFIX}_*.json"
+        for tf in SCRIPT_DIR.glob(prefix):
             files.add(str(tf))
     return sorted(files)
 
 
 def _find_task_file(task_id: str, preferred_tf: str):
-    for tf in [preferred_tf] + [x for x in _all_task_files() if x != preferred_tf]:
+    task_files = _all_task_files()
+    for tf in [preferred_tf] + [x for x in task_files if x != preferred_tf]:
         tasks = _load_scheduled_tasks(tf)
         if task_id in tasks:
             return tf, tasks
@@ -651,7 +734,8 @@ def _find_task_file(task_id: str, preferred_tf: str):
 
 def _collect_chat_tasks(chat_id: int, preferred_tf: str) -> dict:
     out = {}
-    for tf in [preferred_tf] + [x for x in _all_task_files() if x != preferred_tf]:
+    task_files = _all_task_files()
+    for tf in [preferred_tf] + [x for x in task_files if x != preferred_tf]:
         tasks = _load_scheduled_tasks(tf)
         for tid, info in tasks.items():
             if info.get("chat_id") == chat_id:
@@ -681,7 +765,8 @@ def _schedule_job(task_id: str, task_info: dict):
 
             delay = (target - now).total_seconds()
             print(
-                f"  [SCHEDULED TASK] Will run ONCE in {delay/60:.1f} minutes at {hour:02d}:{minute:02d}"
+                f"  [SCHEDULED TASK] Will run ONCE in {delay/60:.1f} "
+                f"minutes at {hour:02d}:{minute:02d}"
             )
 
             def _delayed_run():
@@ -740,9 +825,11 @@ def _start_scheduler():
     for _cid, ws_cfg in CHANNEL_WORKSPACES.items():
         name = ws_cfg.get("name")
         if name:
-            all_task_files.add(str(SCRIPT_DIR / f"hpc_relay_tasks_{name}.json"))
+            t_path = SCRIPT_DIR / f"hpc_relay_tasks_{name}.json"
+            all_task_files.add(str(t_path))
     if AUTO_WORKSPACE_PER_CHAT:
-        for tf in SCRIPT_DIR.glob(f"hpc_relay_tasks_{AUTO_WORKSPACE_PREFIX}_*.json"):
+        p_str = f"hpc_relay_tasks_{AUTO_WORKSPACE_PREFIX}_*.json"
+        for tf in SCRIPT_DIR.glob(p_str):
             all_task_files.add(str(tf))
 
     total = 0
@@ -800,6 +887,29 @@ def get_chat(cid: int, sessions_file=None) -> dict:
     return v
 
 
+def _clear_stale_running_sessions(
+    sessions_file=None, max_age_sec: int = STALE_RUNNING_SEC
+):
+    store = _load_store(sessions_file)
+    now = int(time.time())
+    changed = False
+    for key, cur in list(store.items()):
+        if key.startswith("__") or not isinstance(cur, dict):
+            continue
+        if not cur.get("running"):
+            continue
+        started = int(cur.get("running_started") or 0)
+        if started <= 0 or now - started >= max_age_sec:
+            cur["running"] = False
+            cur["running_started"] = 0
+            cur["running_prompt"] = ""
+            cur["kill_requested"] = "no"
+            store[key] = cur
+            changed = True
+    if changed:
+        _save_store(store, sessions_file)
+
+
 def update_chat(cid: int, sessions_file=None, **kw):
     store = _load_store(sessions_file)
     key = str(cid)
@@ -809,6 +919,75 @@ def update_chat(cid: int, sessions_file=None, **kw):
     cur.update({k: v for k, v in kw.items() if v is not None})
     store[key] = cur
     _save_store(store, sessions_file)
+
+
+def _queue_message(
+    chat_id: int,
+    sessions_file,
+    raw: str,
+    attached_files=None,
+    preempt: bool = False,
+):
+    store = _load_store(sessions_file)
+    key = str(chat_id)
+    cur = store.get(key, {})
+    if isinstance(cur, str):
+        cur = {"session_id": cur, "model": DEFAULT_MODEL}
+    q = cur.get("pending_messages", [])
+    if not isinstance(q, list):
+        q = []
+    item = {
+        "id": f"q_{int(time.time() * 1000)}_{len(q)}",
+        "raw": raw,
+        "attached_files": attached_files or [],
+        "preempt": bool(preempt),
+    }
+    if preempt:
+        q.insert(0, item)
+        msg_cap = repr(raw[:120])
+        print(f"  [QUEUE PREEMPT] Added message for chat={chat_id}: {msg_cap}")
+    else:
+        q.append(item)
+        msg_cap = repr(raw[:120])
+        print(f"  [QUEUE ADD] Added message for chat={chat_id}: {msg_cap}")
+    cur["pending_messages"] = q
+    store[key] = cur
+    _save_store(store, sessions_file)
+    return len(q)
+
+
+def _pop_next_message(chat_id: int, sessions_file):
+    store = _load_store(sessions_file)
+    key = str(chat_id)
+    cur = store.get(key, {})
+    if isinstance(cur, str):
+        return None
+    q = cur.get("pending_messages", [])
+    if not q:
+        return None
+    item = q.pop(0)
+    cur["pending_messages"] = q
+    store[key] = cur
+    _save_store(store, sessions_file)
+    return item
+
+
+def _pending_count(chat_id: int, sessions_file) -> int:
+    cur = _load_store(sessions_file).get(str(chat_id), {})
+    if isinstance(cur, str):
+        return 0
+    q = cur.get("pending_messages", [])
+    return len(q) if isinstance(q, list) else 0
+
+
+def _has_preempt_message(chat_id: int, sessions_file) -> bool:
+    cur = _load_store(sessions_file).get(str(chat_id), {})
+    if isinstance(cur, str):
+        return False
+    q = cur.get("pending_messages", [])
+    if not isinstance(q, list):
+        return False
+    return any(isinstance(item, dict) and item.get("preempt") for item in q)
 
 
 def _record_session(sid: str, sessions_file=None):
@@ -846,9 +1025,55 @@ def _get_session_model(sid: str, sessions_file=None) -> Optional[str]:
     return v if isinstance(v, str) and v else None
 
 
+def _known_session_count(chat_id: int, sessions_file=None) -> int:
+    store = _load_store(sessions_file)
+    known = store.get("__known_sessions__", [])
+    if isinstance(known, list) and known:
+        return len(known)
+    models = store.get("__session_models__", {})
+    count = len(models) if isinstance(models, dict) else 0
+    chat = store.get(str(chat_id), {})
+    if isinstance(chat, dict):
+        sid = chat.get("session_id")
+        if (isinstance(sid, str)
+                and sid.startswith("ses")
+                and sid not in (models or {})):
+            count += 1
+    return count
+
+
+def _chat_task_count(chat_id: int, tasks_file=None) -> int:
+    return len(_collect_chat_tasks(chat_id, tasks_file))
+
+
 def _get_known_sessions(sessions_file=None) -> list:
     """Return list of all session IDs ever seen (local cache)."""
     return _load_store(sessions_file).get("__known_sessions__", [])
+
+
+async def _session_exists_on_this_host(session_id: str) -> bool:
+    if not session_id or not isinstance(session_id, str):
+        return False
+    if not session_id.startswith("ses"):
+        return False
+    script = (
+        f"{_safe_path(OPENCODE)} session show "
+        f"{shlex.quote(session_id)} >/dev/null 2>&1"
+    )
+    if CONNECTION_MODE in ("wsl", "local"):
+        cmd = ["bash", "-lc", script]
+    else:
+        cmd = _ssh_base() + ["bash", "-lc", script]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        rc = await asyncio.wait_for(proc.wait(), 20)
+        return rc == 0
+    except Exception:
+        return False
 
 
 async def _fetch_hpc_sessions() -> list[Tuple[str, str]]:
@@ -908,9 +1133,8 @@ except Exception as e:
         )
         raw = stdout.decode(errors="replace").strip()
         if not raw:
-            print(
-                f"  [_fetch_hpc_sessions:empty output, stderr={stderr.decode(errors='replace')[:200]}]"
-            )
+            err_txt = stderr.decode(errors='replace')[:200]
+            print(f"  [_fetch_hpc_sessions:empty output, stderr={err_txt}]")
             return []
         result = []
         for line in raw.splitlines():
@@ -1007,7 +1231,49 @@ def _safe_path(p: str) -> str:
     return shlex.quote(p)
 
 
-def _oc_script(prompt, sid, model, attached_files=None, workdir=None, unique_token=""):
+def _kill_session_processes(session_id: str, workdir: str = None) -> int:
+    """Best-effort kill lingering local/wsl opencode runs for one session."""
+    if not session_id:
+        return 0
+    killed = 0
+    try:
+        ps_cmd = "ps -eo pid=,args="
+        res = subprocess.run(
+            ["bash", "-lc", ps_cmd],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        for line in res.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                pid_s, args = line.split(None, 1)
+                pid = int(pid_s)
+            except Exception:
+                continue
+            if pid == os.getpid():
+                continue
+            if "opencode run" not in args:
+                continue
+            if f"--session {session_id}" not in args:
+                continue
+            try:
+                os.kill(pid, signal.SIGKILL)
+                killed += 1
+            except ProcessLookupError:
+                pass
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return killed
+
+
+def _oc_script(
+    prompt, sid, model, attached_files=None, workdir=None, unique_token=""
+):
     sess = (
         f"--session {shlex.quote(sid)} "
         if sid and sid.startswith("ses")
@@ -1018,11 +1284,11 @@ def _oc_script(prompt, sid, model, attached_files=None, workdir=None, unique_tok
     for fp in (attached_files or []):
         file_args += f" -f {shlex.quote(fp)}"
     wd = workdir or WORKDIR
-    pid_cmd = f"echo $$ > relay_pid_{unique_token}.pid\n" if unique_token else ""
+    pid_file = f"relay_pid_{unique_token}.pid"
+    pid_cmd = f"echo $$ > {pid_file}\n" if unique_token else ""
     return (
         f"set -euo pipefail\n{setup}"
         f"mkdir -p {_safe_path(wd)} && cd {_safe_path(wd)}\n"
-        f"rm -f {_safe_path(OC_DB_PATH)}-shm 2>/dev/null || true\n"
         f"{pid_cmd}"
         f"exec {_safe_path(OPENCODE)} run -m {shlex.quote(model)} "
         f"--format json {sess}{file_args} -- {shlex.quote(prompt)} 2>&1\n"
@@ -1031,7 +1297,8 @@ def _oc_script(prompt, sid, model, attached_files=None, workdir=None, unique_tok
 
 def _shell_script(cmd, workdir=None):
     wd = workdir or WORKDIR
-    return f"mkdir -p {_safe_path(wd)} && cd {_safe_path(wd)} && {{ {cmd} ; }} 2>&1\n"
+    p = _safe_path(wd)
+    return f"mkdir -p {p} && cd {p} && {{ {cmd} ; }} 2>&1\n"
 
 
 # ================================================================
@@ -1061,15 +1328,17 @@ def _extract_send_file_directives(text: str) -> List[str]:
     paths: List[str] = []
 
     # strict form enclosed by @@
-    for m in re.finditer(r"@@SEND_FILE:\s*([^@\n\r]+?)\s*@@", text, re.IGNORECASE):
+    re_strict = r"@@SEND_FILE:\s*([^@\n\r]+?)\s*@@"
+    for m in re.finditer(re_strict, text, re.IGNORECASE):
         paths.append(m.group(1).strip())
 
     # line form (no trailing @@), capture only first token-like path segment
-    for m in re.finditer(r"^\s*@@SEND_FILE:\s*(.+)$", text, re.IGNORECASE | re.MULTILINE):
+    re_line = r"^\s*@@SEND_FILE:\s*(.+)$"
+    for m in re.finditer(re_line, text, re.IGNORECASE | re.MULTILINE):
         line = m.group(1).strip()
         if "@@" in line:
             line = line.split("@@", 1)[0].strip()
-        # keep only first whitespace-delimited token to avoid grabbing explanation text
+        # prevent grabbing explanation text
         token = line.split()[0] if line else ""
         if token:
             paths.append(token)
@@ -1137,9 +1406,8 @@ async def exec_shell(cmd, workdir=None):
         stderr=asyncio.subprocess.STDOUT,
         limit=1024 * 1024 * 16,
     )
-    stdout, _ = await asyncio.wait_for(
-        proc.communicate(_shell_script(cmd, workdir).encode()), LOCAL_TIMEOUT_SEC
-    )
+    comm_f = proc.communicate(_shell_script(cmd, workdir).encode())
+    stdout, _ = await asyncio.wait_for(comm_f, LOCAL_TIMEOUT_SEC)
     out = stdout.decode(errors="replace").strip()
     rc = proc.returncode
     if rc and rc != 0:
@@ -1150,12 +1418,39 @@ async def exec_shell(cmd, workdir=None):
 # ================================================================
 #  STREAMING OPENCODE
 # ================================================================
+QUEUE_PREEMPT_MARKER = "__QUEUE_PREEMPT__"
+
+
 async def run_opencode(
-    prompt, chat_id, model, session_id, on_progress, on_text_chunk, attached_files=None,
-    workdir=None, sessions_file=None,
+    prompt,
+    chat_id,
+    model,
+    session_id,
+    on_progress,
+    on_text_chunk,
+    attached_files=None,
+    workdir=None,
+    sessions_file=None,
 ):
     unique_token = f"relay_run_{int(time.time()*1000)}_{os.getpid()}"
-    script = _oc_script(prompt, session_id, model, attached_files, workdir, unique_token)
+    script = _oc_script(
+        prompt, session_id, model, attached_files, workdir, unique_token
+    )
+    trace_dir = RUN_TRACE_DIR / unique_token
+    trace_dir.mkdir(parents=True, exist_ok=True)
+    (trace_dir / "prompt.txt").write_text(prompt, encoding="utf-8")
+    (trace_dir / "script.sh").write_text(script, encoding="utf-8")
+    m_data = {
+        "chat_id": chat_id,
+        "model": model,
+        "session_id": session_id,
+        "workdir": workdir,
+        "unique_token": unique_token
+    }
+    (trace_dir / "meta.json").write_text(
+        json.dumps(m_data, ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
     if CONNECTION_MODE in ("wsl", "local"):
         ssh_cmd = _ssh_base() + [
             "timeout",
@@ -1166,7 +1461,12 @@ async def run_opencode(
     else:
         ssh_cmd = _ssh_base() + [f"timeout {int(REMOTE_TIMEOUT_SEC)} bash -ls"]
 
-    async def _once():
+    async def _once(run_session_id=session_id):
+        run_unique_token = f"{int(time.time() * 1000)}_{os.getpid()}"
+        run_script = _oc_script(
+            prompt, run_session_id, model, attached_files,
+            workdir, run_unique_token
+        )
         proc = await asyncio.create_subprocess_exec(
             *ssh_cmd,
             stdin=asyncio.subprocess.PIPE,
@@ -1174,16 +1474,24 @@ async def run_opencode(
             stderr=asyncio.subprocess.STDOUT,
             limit=1024 * 1024 * 16,
         )
-        proc.stdin.write(script.encode())
+        proc.stdin.write(run_script.encode())
         await proc.stdin.drain()
         proc.stdin.close()
 
         def _force_kill():
-            kill_cmd = f"kill -9 $(cat {_safe_path(workdir or WORKDIR)}/relay_pid_{unique_token}.pid 2>/dev/null) 2>/dev/null || true"
+            p_file = f"relay_pid_{unique_token}.pid"
+            wd_p = _safe_path(workdir or WORKDIR)
+            kill_cmd = (
+                f"kill -9 $(cat {wd_p}/{p_file} 2>/dev/null) "
+                "2>/dev/null || true"
+            )
             if CONNECTION_MODE in ("wsl", "local"):
                 subprocess.run(["bash", "-c", kill_cmd], capture_output=True)
             else:
-                subprocess.run(_ssh_base() + ["bash", "-c", kill_cmd], capture_output=True)
+                subprocess.run(
+                    _ssh_base() + ["bash", "-c", kill_cmd],
+                    capture_output=True
+                )
             try:
                 proc.kill()
             except Exception:
@@ -1194,7 +1502,6 @@ async def run_opencode(
         lines = []
         t0 = time.time()
         last_json_t = t0
-        await on_progress(f"{E.WAIT} Connected -- waiting for response...")
         while True:
             elapsed = time.time() - t0
             now_t = time.time()
@@ -1218,9 +1525,11 @@ async def run_opencode(
             except asyncio.TimeoutError:
                 silence = time.time() - last_json_t
                 if silence > 180:
-                    await on_progress(
-                        f"{E.WARN} Silent 3+ mins (ask_question pending?). Send /kill. [{int(elapsed)}s]"
+                    prog_m = (
+                        f"{E.WARN} Silent 3+ mins (ask_question?). "
+                        f"Send /kill. [{int(elapsed)}s]"
                     )
+                    await on_progress(prog_m)
                 else:
                     await on_progress(
                         f"{E.WAIT} Still processing... [{int(elapsed)}s]"
@@ -1239,7 +1548,8 @@ async def run_opencode(
                 # Infinite garbage spam warning
                 if time.time() - last_json_t > 180:
                     await on_progress(
-                        f"{E.WARN} 3+ mins non-JSON spam (stuck loop?). Send /kill. [{int(elapsed)}s]"
+                        f"{E.WARN} 3+ mins non-JSON spam (stuck loop?). "
+                        f"Send /kill. [{int(elapsed)}s]"
                     )
                 # Non-JSON lines: only store if small
                 if len(decoded) < 5000:
@@ -1291,38 +1601,55 @@ async def run_opencode(
             # ---- ask_question detection (headless trap) ----
             if etype == "tool_use" and tool_name.startswith("ask_question"):
                 await on_progress(
-                    f"{E.WARN} Model invoked ask_question in headless mode. Terminating."
+                    f"{E.WARN} Model invoked ask_question in headless "
+                    "mode. Terminating."
                 )
                 _force_kill()
                 raise RuntimeError(
-                    "Model attempted to use ask_question tool, which hangs in headless mode."
+                    "Model attempted to use ask_question tool, which "
+                    "hangs in headless mode."
                 )
 
             # ---- Regular tool progress (apply_patch, etc.) ----
             if etype == "tool_use":
-                status = (part.get("state") or {}).get("status", "")
+                state_dict = part.get("state") or {}
+                status = (state_dict.get("status", "") or "").lower()
                 title_str = (part.get("state") or {}).get("title", "")[:60]
-                info = f"{tool_name}"
-                if status:
-                    info += f" ({status})"
+                boring = {"completed", "started", "pending", "running"}
+                if tool_name in ("read", "write", "edit", "exec", "bash"):
+                    label = tool_name
+                else:
+                    label = tool_name
+                if (status == "completed"
+                        and _has_preempt_message(chat_id, sessions_file)):
+                    await on_progress(f"{E.TOOL} {label}")
+                    try:
+                        p_file = trace_dir / "preempt.txt"
+                        p_file.write_text(
+                            f"preempt_after_tool={label}\n",
+                            encoding="utf-8"
+                        )
+                    except Exception:
+                        pass
+                    _force_kill()
+                    return 0, QUEUE_PREEMPT_MARKER, latest_sid
+                if status in boring and not title_str:
+                    continue
+                info = f"{label}"
                 if title_str:
                     info += f": {title_str}"
                 await on_progress(f"{E.TOOL} {info}")
-                # Don't store massive tool_use lines (diffs can be 100KB+)
                 continue
 
             # ---- Step events ----
             if etype in ("step_start", "step_finish"):
-                reason = part.get("reason", "")
-                if reason:
-                    await on_progress(f"{E.TOOL} step: {reason}")
                 continue
 
             if etype == "text":
                 t = part.get("text")
                 if isinstance(t, str) and t.strip():
-                    # Some providers stream cumulative text, others may reset chunks.
-                    # Handle both robustly to avoid half/missing replies.
+                    # Some providers stream cumulative text, others may
+                    # reset chunks. Handle both robustly to avoid missing.
                     if prev_text and t.startswith(prev_text):
                         delta = t[len(prev_text):]
                     else:
@@ -1334,9 +1661,17 @@ async def run_opencode(
         return rc, "".join(lines), latest_sid
 
     async with OPENCODE_RUN_LOCK:
+        async def _once_fresh():
+            return await _once(None)
+
         try:
             rc, output, sid = await _once()
         except subprocess.TimeoutExpired:
+            try:
+                p_file = trace_dir / "timeout.txt"
+                p_file.write_text("timeout", encoding="utf-8")
+            except Exception:
+                pass
             if RETRY_ON_TIMEOUT:
                 await asyncio.to_thread(_close_master)
                 await on_progress(f"{E.RETRY} Retrying...")
@@ -1344,14 +1679,25 @@ async def run_opencode(
             else:
                 raise
 
-        lock_markers = ("locking protocol", "database is locked", "sqlite_busy")
+        lock_markers = (
+            "locking protocol", "database is locked", "sqlite_busy"
+        )
         if any(m in (output or "").lower() for m in lock_markers):
-            await on_progress(f"{E.RETRY} Detected lock contention, retrying once...")
+            await on_progress(
+                f"{E.RETRY} Detected lock contention, retrying once..."
+            )
             await asyncio.sleep(2)
             rc2, output2, sid2 = await _once()
             rc, output = rc2, output2
             if sid2:
                 sid = sid2
+
+    if output == QUEUE_PREEMPT_MARKER:
+        returned_sid = sid
+        if isinstance(returned_sid, str) and returned_sid.startswith("ses"):
+            update_chat(chat_id, sessions_file, session_id=returned_sid)
+            _record_session(returned_sid)
+        return QUEUE_PREEMPT_MARKER, returned_sid
 
     _, final_text = _parse_all(output)
 
@@ -1360,16 +1706,44 @@ async def run_opencode(
         update_chat(chat_id, sessions_file, session_id=returned_sid)
         _record_session(returned_sid)  # track in history
 
+    output_lc = (output or "").lower()
+    recoverable_markers = (
+        "invalid tool",
+        "unknown tool",
+        "tool not found",
+        "tool registry",
+        "mcp",
+        "chrome devtools",
+        "chrome mcp",
+    )
+    recoverable_failure = any(
+        marker in output_lc for marker in recoverable_markers
+    )
+
     if not final_text:
-        if "NotFoundError" in output and "Session not found" in output:
+        if recoverable_failure:
+            try:
+                t_file = trace_dir / "auto-recover.txt"
+                t_file.write_text(output[:4000], encoding="utf-8")
+            except Exception:
+                pass
             raw_msg = (
-                f"{E.WARN} **Session does not exist on this machine!**\n"
-                "It seems you passed a session ID from the other bot. "
-                "Please type `/new` to start a new session "
-                "on this host."
+                f"{E.RETRY} Tool environment broke mid-run. I kept "
+                "this session and queue intact \u2014 send your next @ "
+                "message and I\u2019ll continue from the same "
+                "conversation history."
+            )
+        elif "notfounderror" in output_lc and "session not found" in output_lc:
+            raw_msg = (
+                f"{E.WARN} This session ID is invalid on this host. "
+                "I did not auto-switch to a new chat, so your history "
+                "mapping stays untouched."
             )
         else:
-            raw_msg = f"{E.WARN} RC={rc}, No valid JSON text extracted.\nRAW OUTPUT:\n{output[:2000]}"
+            raw_msg = (
+                f"{E.WARN} RC={rc}, No valid JSON text extracted.\n"
+                f"RAW OUTPUT:\n{output[:2000]}"
+            )
         return raw_msg, returned_sid
 
     return final_text.strip(), returned_sid
@@ -1402,7 +1776,7 @@ def _display_sid(sid, is_new=False):
 
 
 def _smart_chunks(text, limit=TG_CHUNK):
-    """Split text into chunks at paragraph / newline boundaries. Never raises."""
+    """Split text into chunks at paragraphs. Never raises."""
     try:
         if not text:
             return [""]
@@ -1442,6 +1816,8 @@ def _smart_chunks(text, limit=TG_CHUNK):
 
 
 async def _safe_edit(msg, text, use_html=False):
+    if msg is None:
+        return
     try:
         kw = {"parse_mode": ParseMode.HTML} if use_html else {}
         await msg.edit_text(text, **kw)
@@ -1496,7 +1872,9 @@ async def _delete_or_check(msg):
         await _safe_edit(msg, f"{E.OK} DONE")
 
 
-async def _process_file_request(update, action, pattern):
+async def _process_file_request(
+    update, action, pattern
+):
     import os
     import shlex
 
@@ -1504,12 +1882,13 @@ async def _process_file_request(update, action, pattern):
 
     # Safely resolve files using Python on HPC to prevent Bash wildcard
     # injection
+    p_cl = repr(pattern_clean)
     py_script = f"""import glob, os, sys
 try: os.chdir(os.path.expanduser({repr(WORKDIR)}))
 except: pass
-matches = glob.glob(os.path.expanduser({repr(pattern_clean)}), recursive=True)
-if not matches and os.path.exists({repr(pattern_clean)}):
-    matches = [{repr(pattern_clean)}]
+matches = glob.glob(os.path.expanduser({p_cl}), recursive=True)
+if not matches and os.path.exists({p_cl}):
+    matches = [{p_cl}]
 for match in matches:
     abs_p = os.path.realpath(match)
     if os.path.isfile(abs_p):
@@ -1533,16 +1912,19 @@ for match in matches:
 
     files = [f.strip() for f in stdout.decode().splitlines() if f.strip()]
     if not files:
-        await update.message.reply_text(
-            f"{E.ERR} <b>File not found:</b> <code>{html.escape(pattern_clean)}</code>\nDoes not exist or matched nothing.",
-            parse_mode=ParseMode.HTML,
+        t_msg = (
+            f"{E.ERR} <b>File not found:</b> "
+            f"<code>{html.escape(pattern_clean)}</code>\n"
+            "Does not exist or matched nothing."
         )
+        await update.message.reply_text(t_msg, parse_mode=ParseMode.HTML)
         return
     if len(files) > 10:
-        await update.message.reply_text(
-            f"{E.WARN} Wildcard matched {len(files)} files. Limiting to first 10.",
-            parse_mode=ParseMode.HTML,
+        t_msg = (
+            f"{E.WARN} Wildcard matched {len(files)} files. "
+            "Limiting to first 10."
         )
+        await update.message.reply_text(t_msg, parse_mode=ParseMode.HTML)
         files = files[:10]
 
     # -- RCLONE UPLOAD --
@@ -1552,7 +1934,8 @@ for match in matches:
             bash_cmds.append(SETUP_CMD)
         for f in files:
             bash_cmds.append(
-                f"rclone copy {shlex.quote(f)} {shlex.quote(RCLONE_DEST)}/ --progress"
+                f"rclone copy {shlex.quote(f)} "
+                f"{shlex.quote(RCLONE_DEST)}/ --progress"
             )
         script = "\n".join(bash_cmds)
         try:
@@ -1566,9 +1949,12 @@ for match in matches:
             out, _ = await asyncio.wait_for(
                 proc.communicate(script.encode()), 1800
             )
+            t_res = (
+                f"{E.OK} <b>Upload complete!</b> ({len(files)} files)\n"
+                f"<pre>{html.escape(out.decode()[:2500])}</pre>"
+            )
             await update.message.reply_text(
-                f"{E.OK} <b>Upload complete!</b> ({len(files)} files)\n<pre>{html.escape(out.decode()[:2500])}</pre>",
-                parse_mode=ParseMode.HTML,
+                t_res, parse_mode=ParseMode.HTML,
             )
         except Exception as e:
             await update.message.reply_text(
@@ -1581,7 +1967,10 @@ for match in matches:
         bash_script = f"""
 abs={shlex.quote(f)}
 size=$(stat -c%s "$abs")
-if (( size > 40000000 )); then echo "ERR: File too large (Size is $size bytes. Max allowed is 40MB). Please use /upload instead." >&2; exit 1; fi
+if (( size > 40000000 )); then
+  echo "ERR: File too large. Max 40MB." >&2
+  exit 1
+fi
 cat "$abs"
 """
         cmd = _ssh_base() + ["bash", "-s"]
@@ -1606,8 +1995,11 @@ cat "$abs"
             err_msg = (
                 stderr.decode(errors="replace").strip() or "Unknown error"
             )
+            f_base = html.escape(os.path.basename(f))
+            e_html = html.escape(err_msg)
             await update.message.reply_text(
-                f"{E.ERR} <b>Cannot fetch file:</b> <code>{html.escape(os.path.basename(f))}</code>\n<i>{html.escape(err_msg)}</i>",
+                f"{E.ERR} <b>Cannot fetch file:</b> <code>{f_base}</code>\n"
+                f"<i>{e_html}</i>",
                 parse_mode=ParseMode.HTML,
             )
             continue
@@ -1623,12 +2015,16 @@ cat "$abs"
                     # Fallback for dimensions/compression limits (Telegram
                     # rejects large wide/tall plots)
                     print(
-                        f"  [photo upload failed for {filename}:{ex1}. Retrying as document.]"
+                        f"  [photo upload failed for {filename}: {ex1}. "
+                        "Retrying as document.]"
                     )
                     await update.message.reply_document(
                         document=data,
                         filename=filename,
-                        caption=f"File: {filename} (sent as document due to dimension limits)",
+                        caption=(
+                            f"File: {filename} (sent as document due to "
+                            "dimension limits)"
+                        ),
                     )
             else:
                 await update.message.reply_document(
@@ -1642,20 +2038,28 @@ cat "$abs"
             )
 
 
-async def _extract_user_prompt_and_files(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> Tuple[str, List[str]]:
-    """Extract user text/caption and download image attachments locally."""
+async def _extract_user_prompt_and_files(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int
+) -> Tuple[str, List[str]]:
+    """Extract user text/caption and download attachments locally."""
     msg = update.message
     raw = ((msg.text or msg.caption) or "").strip()
     files: List[str] = []
+    attachment_kinds: List[str] = []
 
     if msg.photo:
         try:
             largest = msg.photo[-1]
             tg_file = await context.bot.get_file(largest.file_id)
-            fname = f"tg_{chat_id}_{int(time.time()*1000)}_{largest.file_unique_id}.jpg"
+            ts = int(time.time() * 1000)
+            f_uid = largest.file_unique_id
+            fname = f"tg_{chat_id}_{ts}_{f_uid}.jpg"
             local_path = INBOX_DIR / fname
             await tg_file.download_to_drive(custom_path=str(local_path))
             files.append(str(local_path))
+            attachment_kinds.append("image")
         except Exception as e:
             print(f"  [photo download failed: {e}]")
 
@@ -1667,14 +2071,146 @@ async def _extract_user_prompt_and_files(update: Update, context: ContextTypes.D
             if not suffix:
                 mime = (doc.mime_type or "").split("/")[-1] or "bin"
                 suffix = "." + mime
-            fname = f"tg_{chat_id}_{int(time.time()*1000)}_{doc.file_unique_id}{suffix}"
+            ts = int(time.time() * 1000)
+            f_uid = doc.file_unique_id
+            fname = f"tg_{chat_id}_{ts}_{f_uid}{suffix}"
             local_path = INBOX_DIR / fname
             await tg_file.download_to_drive(custom_path=str(local_path))
             files.append(str(local_path))
+            attachment_kinds.append("image")
         except Exception as e:
             print(f"  [image document download failed: {e}]")
 
+    if msg.voice:
+        try:
+            voice = msg.voice
+            v_mime = getattr(voice, 'mime_type', None)
+            v_dur = getattr(voice, 'duration', None)
+            print(
+                f"  [VOICE] received file_id={voice.file_id} "
+                f"mime={v_mime} duration={v_dur}"
+            )
+            tg_file = await context.bot.get_file(voice.file_id)
+            ts = int(time.time() * 1000)
+            f_uid = voice.file_unique_id
+            fname = f"tg_{chat_id}_{ts}_{f_uid}.ogg"
+            local_path = INBOX_DIR / fname
+            await tg_file.download_to_drive(custom_path=str(local_path))
+            print(f"  [VOICE] downloaded to {local_path}")
+            files.append(str(local_path))
+            attachment_kinds.append("voice")
+        except Exception as e:
+            print(f"  [voice download failed: {e}]")
+
+    if msg.audio:
+        try:
+            audio = msg.audio
+            a_mime = getattr(audio, 'mime_type', None)
+            a_dur = getattr(audio, 'duration', None)
+            print(
+                f"  [AUDIO] received file_id={audio.file_id} "
+                f"mime={a_mime} duration={a_dur}"
+            )
+            tg_file = await context.bot.get_file(audio.file_id)
+            a_nm = audio.file_name
+            sfx = Path(a_nm).suffix if a_nm else ".audio"
+            ts = int(time.time() * 1000)
+            u_id = audio.file_unique_id
+            fn_t = f"t{chat_id}_{int(ts/1000)}_{u_id}"
+            fn = f"{fn_t}{sfx}"
+            local_path = INBOX_DIR / fn
+            await tg_file.download_to_drive(custom_path=str(local_path))
+            print(f"  [AUDIO] downloaded to {local_path}")
+            files.append(str(local_path))
+            attachment_kinds.append("audio")
+        except Exception as e:
+            print(f"  [audio download failed: {e}]")
+
+    if msg.video_note:
+        try:
+            vn = msg.video_note
+            vn_dur = getattr(vn, 'duration', None)
+            print(
+                f"  [VIDEO_NOTE] received file_id={vn.file_id} "
+                f"duration={vn_dur}"
+            )
+            tg_file = await context.bot.get_file(vn.file_id)
+            ts = int(time.time() * 1000)
+            f_uid = vn.file_unique_id
+            fname = f"tg_{chat_id}_{ts}_{f_uid}.mp4"
+            local_path = INBOX_DIR / fname
+            await tg_file.download_to_drive(custom_path=str(local_path))
+            print(f"  [VIDEO_NOTE] downloaded to {local_path}")
+            files.append(str(local_path))
+            attachment_kinds.append("video_note")
+        except Exception as e:
+            print(f"  [video_note download failed: {e}]")
+
+    if files and not raw:
+        kinds = set(attachment_kinds)
+        if kinds <= {"voice", "audio", "video_note"}:
+            audio_path = files[0]
+            try:
+                transcript = await asyncio.to_thread(
+                    _transcribe_audio_file, audio_path
+                )
+            except Exception as e:
+                print(f"  [VOICE] transcription failed: {e}")
+                transcript = ""
+            if transcript:
+                tr_cap = repr(transcript[:200])
+                print(f"  [VOICE] transcript: {tr_cap}")
+                files = []
+                raw = (
+                    "The user sent a voice message. Below is the "
+                    "transcript converted locally with faster-whisper. "
+                    "Treat the transcript as the real user input and "
+                    "respond accordingly.\n\n"
+                    f"[voice transcript]\n{transcript}"
+                )
+            else:
+                if CONNECTION_MODE == "ssh":
+                    raw = (
+                        "Local Whisper transcription is required in SSH/HPC "
+                        "relay mode because the audio file exists on the "
+                        "relay machine, not on the remote host. Please "
+                        "install and enable a local Whisper model on the "
+                        "relay machine first."
+                    )
+                else:
+                    raw = (
+                        "Local Whisper transcription is not available yet. "
+                        "Please install and enable a local Whisper model "
+                        "on the relay machine first."
+                    )
+        elif kinds <= {"image"}:
+            raw = "Please analyze the attached image."
+            raw = "Please analyze the attached image."
+
     return raw, files
+
+
+def _get_whisper_model():
+    global _WHISPER_MODEL
+    if _WHISPER_MODEL is None:
+        _WHISPER_MODEL = WhisperModel(
+            WHISPER_MODEL_SIZE, device=WHISPER_DEVICE
+        )
+    return _WHISPER_MODEL
+
+
+def _transcribe_audio_file(path: str) -> str:
+    model = _get_whisper_model()
+    segments, info = model.transcribe(
+        path, vad_filter=True, beam_size=5
+    )
+    parts = []
+    for seg in segments:
+        txt = (seg.text or '').strip()
+        if txt:
+            parts.append(txt)
+    s_join = ' '.join(parts)
+    return s_join.strip()
 
 
 def _fallback_models() -> List[str]:
@@ -1720,12 +2256,14 @@ async def _list_available_models() -> List[str]:
         if models:
             return models
         if etxt.strip():
-            print(f"  [_list_available_models empty stdout; stderr: {etxt[:300]}]")
+            msg = f"  [_lm error_out: {etxt[:200]}]"
+            print(msg)
     except Exception as e:
         print(f"  [_list_available_models error: {e}]")
 
     fb = sorted(set(_fallback_models()))
-    print(f"  [_list_available_models fallback -> {len(fb)} models]")
+    msg = f"  [_list_available_models fallback -> {len(fb)} mod.]"
+    print(msg)
     return fb
 
 
@@ -1747,29 +2285,44 @@ def _parse_schedule_text(text: str, task_prompt: str = "") -> Optional[dict]:
         unit = m.group(2)
         if unit.endswith('s') is False:
             unit += 's'
-        return {"type": "interval", "interval": n, "unit": unit, "task": task_prompt}
+        return {
+            "type": "interval", "interval": n,
+            "unit": unit, "task": task_prompt
+        }
 
     m = re.match(r"^(?:daily\s+|at\s+)(\d{1,2}):(\d{2})$", t)
     if m:
         h = int(m.group(1))
         mi = int(m.group(2))
         if 0 <= h <= 23 and 0 <= mi <= 59:
-            return {"type": "daily", "hour": h, "minute": mi, "task": task_prompt}
+            return {
+                "type": "daily", "hour": h, "minute": mi, "task": task_prompt
+            }
 
-    m = re.match(r"^once\s+(\d{1,2}):(\d{2})$", t)
+    r_once = r"^once\s+(\d{1,2}):(\d{2})$"
+    m = re.match(r_once, t)
     if m:
         h = int(m.group(1))
         mi = int(m.group(2))
         if 0 <= h <= 23 and 0 <= mi <= 59:
-            return {"type": "once", "hour": h, "minute": mi, "task": task_prompt}
+            return {
+                "type": "once", "hour": h, "minute": mi, "task": task_prompt
+            }
 
     m = re.match(r"^after\s+(\d+)\s+(minute|minutes|hour|hours)$", t)
     if m:
         n = int(m.group(1))
         unit = m.group(2)
         now = datetime.now()
-        target = now + (timedelta(minutes=n) if 'min' in unit else timedelta(hours=n))
-        return {"type": "once", "hour": target.hour, "minute": target.minute, "task": task_prompt}
+        if 'min' in unit:
+            diff = timedelta(minutes=n)
+        else:
+            diff = timedelta(hours=n)
+        target = now + diff
+        return {
+            "type": "once", "hour": target.hour,
+            "minute": target.minute, "task": task_prompt
+        }
     return None
 
 
@@ -1788,13 +2341,15 @@ async def _cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ws_sf = ws["sessions_file"]
     update_chat(chat_id, ws_sf, session_id="__new__", running=False)
     cur_model = get_chat(chat_id, ws_sf).get("model", DEFAULT_MODEL)
+    m_esc = html.escape(cur_model)
     await update.message.reply_text(
-        f"{E.OK} <b>New session queued</b>\n{E.BOT} <code>{html.escape(cur_model)}</code>",
+        f"{E.OK} <b>New session queued</b>\n{E.BOT} <code>{m_esc}</code>",
         parse_mode=ParseMode.HTML,
     )
 
 
-async def _cmd_send_like(update: Update, context: ContextTypes.DEFAULT_TYPE, action: str):
+async def _cmd_send_like(
+        update: Update, context: ContextTypes.DEFAULT_TYPE, action: str):
     if not _is_allowed_update(update):
         return
     if not context.args:
@@ -1804,8 +2359,9 @@ async def _cmd_send_like(update: Update, context: ContextTypes.DEFAULT_TYPE, act
         )
         return
     pattern = " ".join(context.args).strip()
+    prog = 'Uploading to gdrive' if action == 'upload' else 'Fetching file(s)'
     await update.message.reply_text(
-        f"{E.WAIT} <i>{'Uploading to gdrive' if action == 'upload' else 'Fetching file(s)'}...</i>",
+        f"{E.WAIT} <i>{prog}...</i>",
         parse_mode=ParseMode.HTML,
     )
     await _process_file_request(update, action, pattern)
@@ -1826,8 +2382,20 @@ async def _cmd_kill(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id if update.effective_user else None
     ws = _resolve_workspace(chat_id, uid)
     ws_sf = ws["sessions_file"]
-    update_chat(chat_id, ws_sf, kill_requested="yes", running=False)
-    await update.message.reply_text(f"{E.OK} Kill signal sent. Running process will terminate.")
+    chat = get_chat(chat_id, ws_sf)
+    killed = _kill_session_processes(
+        chat.get("session_id"), ws.get("workdir")
+    )
+    update_chat(
+        chat_id, ws_sf, kill_requested="yes", running=False,
+        running_started=0, running_prompt="", pending_messages=[]
+    )
+    extra = ""
+    if killed:
+        extra = f" Killed {killed} lingering opencode process(es)."
+    await update.message.reply_text(
+        f"{E.OK} Kill-all sent. Cleared queued messages.{extra}"
+    )
 
 
 async def _cmd_q(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1857,7 +2425,7 @@ async def _opencode_stats_summary(days: int = 7) -> dict:
             "output": r"^\s*Output\s+([0-9.,KMB]+)\s*$",
             "cache_read": r"^\s*Cache Read\s+([0-9.,KMB]+)\s*$",
             "cache_write": r"^\s*Cache Write\s+([0-9.,KMB]+)\s*$",
-            "avg_tokens_session": r"^\s*Avg Tokens/Session\s+([0-9.,KMB]+)\s*$",
+            "avg_tok_sess": r"^\s*Avg Tokens/Session\s+([0-9.,KMB]+)\s*$",
             "total_cost": r"^\s*Total Cost\s+\$?([0-9.,]+)\s*$",
         }
         out = {}
@@ -1865,34 +2433,42 @@ async def _opencode_stats_summary(days: int = 7) -> dict:
             m = re.search(pat, clean, re.MULTILINE)
             if m:
                 out[k] = m.group(1)
-        mm = re.search(r"^\s*([a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+)\s*$", clean, re.MULTILINE)
+        mm_pat = r"^\s*([a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+)\s*$"
+        mm = re.search(mm_pat, clean, re.MULTILINE)
         if mm:
             out["top_model"] = mm.group(1)
         return out
     except Exception as e:
-        print(f"  [_opencode_stats_summary error: {e}]")
+        msg = f"  [_opencode_stats_summary error: {e}]"
+        print(msg)
         return {}
 
 
 async def _cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_allowed_update(update):
         return
-    chat_id = update.effective_chat.id
-    uid = update.effective_user.id if update.effective_user else None
-    ws = _resolve_workspace(chat_id, uid)
+    c_id = update.effective_chat.id
+    u_id = update.effective_user.id if update.effective_user else None
+    ws = _resolve_workspace(c_id, u_id)
     ws_sf = ws["sessions_file"]
-    msg = await update.message.reply_text(f"{E.WAIT} Loading model providers...")
+    m_msg = f"{E.WAIT} Loading model providers..."
+    msg = await update.message.reply_text(m_msg)
     models = await _list_available_models()
     await _delete_or_check(msg)
     if not models:
         await update.message.reply_text(f"{E.ERR} Failed to load model list.")
         return
-    update_chat(chat_id, ws_sf, model_catalog=models)
+    update_chat(c_id, ws_sf, model_catalog=models)
     grouped = _models_by_provider(models)
-    buttons = [[InlineKeyboardButton(f"{prov} ({len(ms)})", callback_data=f"mdlprov:{prov}")] for prov, ms in grouped.items()]
+    buttons = []
+    for prov, ms in grouped.items():
+        btn = InlineKeyboardButton(
+            f"{prov} ({len(ms)})", callback_data=f"mdlprov:{prov}"
+        )
+        buttons.append([btn])
+    t_p = f"{E.BOT} <b>Select provider</b>"
     await update.message.reply_text(
-        f"{E.BOT} <b>Select provider</b>",
-        parse_mode=ParseMode.HTML,
+        t_p, parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(buttons),
     )
 
@@ -1907,24 +2483,31 @@ async def _cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = get_chat(chat_id, ws_sf)
     if context.args:
         req_sid = context.args[0].strip()
+        req_esc = html.escape(req_sid)
         if not req_sid.startswith("ses_"):
             await update.message.reply_text(
-                f"{E.ERR} <b>Invalid session ID:</b> <code>{html.escape(req_sid)}</code>",
+                f"{E.ERR} <b>Invalid session ID:</b> <code>{req_esc}</code>",
                 parse_mode=ParseMode.HTML,
             )
             return
-        status_msg = await update.message.reply_text(f"{E.WAIT} Checking session on HPC...")
+        status_msg = await update.message.reply_text(
+            f"{E.WAIT} Checking session on HPC..."
+        )
         exists = await _is_valid_session(req_sid)
-        await _delete_or_check(status_msg)
+        if status_msg is not None:
+            await _delete_or_check(status_msg)
         if not exists:
+            msg_t = f"{E.ERR} <b>Session not found:</b> <code>{req_esc}</code>"
             await update.message.reply_text(
-                f"{E.ERR} <b>Session not found:</b> <code>{html.escape(req_sid)}</code>",
-                parse_mode=ParseMode.HTML,
+                msg_t, parse_mode=ParseMode.HTML,
             )
             return
         update_chat(chat_id, ws_sf, session_id=req_sid)
+        sid_esc = html.escape(req_sid)
+        m_esc = html.escape(chat.get('model', DEFAULT_MODEL))
         await update.message.reply_text(
-            f"{E.OK} <b>Session</b> <code>{html.escape(req_sid)}</code>\n{E.BOT} <code>{html.escape(chat.get('model', DEFAULT_MODEL))}</code>",
+            f"{E.OK} <b>Session</b> <code>{sid_esc}</code>\n"
+            f"{E.BOT} <code>{m_esc}</code>",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -1932,90 +2515,147 @@ async def _cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # no id passed: show recent sessions for quick pick
     sessions = await _fetch_hpc_sessions()
     if not sessions:
-        await update.message.reply_text(
-            f"{E.WARN} No recent sessions found.\nUse <code>/new</code> to start one.",
-            parse_mode=ParseMode.HTML,
+        msg_t = (
+            f"{E.WARN} No sessions found.\n"
+            "Use <code>/new</code> to start one."
         )
+        await update.message.reply_text(msg_t, parse_mode=ParseMode.HTML)
         return
     buttons = []
     for sid, title in sessions[:12]:
         label = (title or sid)[:40]
-        buttons.append([InlineKeyboardButton(label, callback_data=f"sidset:{sid}")])
+        btn = InlineKeyboardButton(label, callback_data=f"sidset:{sid}")
+        buttons.append([btn])
+    s_id = chat.get('session_id')
+    cur_esc = html.escape(_display_sid(s_id))
     await update.message.reply_text(
-        f"{E.SESS} <b>Select a recent session</b>\nCurrent: <code>{html.escape(_display_sid(chat.get('session_id')))}</code>",
+        f"{E.SESS} <b>Select a recent session</b>\n"
+        f"Current: <code>{cur_esc}</code>",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(buttons),
     )
 
 
-async def _on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def _on_callback_query(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
     if not _is_allowed_update(update):
         return
     q = update.callback_query
     await q.answer()
-    chat_id = q.message.chat_id
-    uid = q.from_user.id if q.from_user else None
-    ws = _resolve_workspace(chat_id, uid)
+    c_id = q.message.chat_id
+    u_id = q.from_user.id if q.from_user else None
+    ws = _resolve_workspace(c_id, u_id)
     ws_sf = ws["sessions_file"]
     ws_tf = ws["tasks_file"]
     data = q.data or ""
 
+    if data == "st:back":
+        update_chat(c_id, ws_sf, pending_edit={})
+        await _render_status(q.message, c_id, u_id, ws, is_callback=True)
+        return
+
+    if data == "st:id":
+        update_chat(c_id, ws_sf, pending_edit={})
+        sessions = await _fetch_hpc_sessions()
+        if not sessions:
+            kb = [[InlineKeyboardButton("⬅️ Back", callback_data="st:back")]]
+            ikb = InlineKeyboardMarkup(kb)
+            e_m = f"{E.WARN} No sessions found."
+            await q.edit_message_text(e_m, reply_markup=ikb)
+            return
+        rows = []
+        for sid, title in sessions[:12]:
+            label = (title or sid)[:40]
+            cb = f"sidset:{sid}"
+            rows.append([InlineKeyboardButton(label, callback_data=cb)])
+        b_st = InlineKeyboardButton("⬅️ Back", callback_data="st:back")
+        rows.append([b_st])
+        cur_sd = get_chat(c_id, ws_sf).get("session_id")
+        h_sid = html.escape(_display_sid(cur_sd))
+        txt = f"{E.SESS} <b>Session</b> (Current: <code>{h_sid}</code>)"
+        await q.edit_message_text(
+            txt, parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+        return
+
+    if data == "st:sch" or data == "schL":
+        update_chat(c_id, ws_sf, pending_edit={})
+        await _render_schedule_list(c_id, q, ws_tf)
+        return
+
     if data.startswith("mdlprov:"):
         provider = data.split(":", 1)[1]
-        models = get_chat(chat_id, ws_sf).get("model_catalog") or []
+        models = get_chat(c_id, ws_sf).get("model_catalog") or []
         grouped = _models_by_provider(models)
         options = grouped.get(provider, [])
         if not options:
             await q.edit_message_text(f"{E.ERR} Provider has no models.")
             return
-        cur_model = get_chat(chat_id, ws_sf).get("model", DEFAULT_MODEL)
+        cur_model = get_chat(c_id, ws_sf).get("model", DEFAULT_MODEL)
         rows = []
         for m in options:
             name = m.split('/', 1)[1]
             label = ("✅ " + name) if m == cur_model else name
-            rows.append([InlineKeyboardButton(label, callback_data=f"mdlset:{m}")])
-        rows.append([InlineKeyboardButton("⬅️ Back", callback_data="mdlback")])
+            btn = InlineKeyboardButton(label, callback_data=f"mdlset:{m}")
+            rows.append([btn])
+        rows.append(
+            [InlineKeyboardButton("⬅️ Back", callback_data="mdlback")]
+        )
+        prov_esc = html.escape(provider)
         await q.edit_message_text(
-            f"{E.BOT} <b>{html.escape(provider)}</b> — select model", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows)
+            f"{E.BOT} <b>{prov_esc}</b> \u2014 select model",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(rows)
         )
         return
 
     if data == "mdlback":
-        models = get_chat(chat_id, ws_sf).get("model_catalog") or []
+        models = get_chat(c_id, ws_sf).get("model_catalog") or []
         grouped = _models_by_provider(models)
-        buttons = [[InlineKeyboardButton(f"{prov} ({len(ms)})", callback_data=f"mdlprov:{prov}")] for prov, ms in grouped.items()]
+        btns = []
+        for prov, ms in grouped.items():
+            b = InlineKeyboardButton(
+                f"{prov} ({len(ms)})", callback_data=f"mdlprov:{prov}"
+            )
+            btns.append([b])
         await q.edit_message_text(
             f"{E.BOT} <b>Select provider</b>",
             parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup(buttons),
+            reply_markup=InlineKeyboardMarkup(btns),
         )
         return
 
     if data.startswith("mdlset:"):
         model = data.split(":", 1)[1]
-        update_chat(chat_id, ws_sf, model=model)
+        update_chat(c_id, ws_sf, model=model)
+        m_esc = html.escape(model)
         await q.edit_message_text(
-            f"{E.OK} <b>Model switched</b>\n{E.BOT} <code>{html.escape(model)}</code>",
+            f"{E.OK} <b>Model switched</b>\n"
+            f"{E.BOT} <code>{m_esc}</code>",
             parse_mode=ParseMode.HTML,
         )
-        return
-
-    if data.startswith("sidset:"):
-        sid = data.split(":", 1)[1]
-        update_chat(chat_id, ws_sf, session_id=sid)
-        await q.edit_message_text(
-            f"{E.OK} <b>Session switched</b>\n{E.SESS} <code>{html.escape(sid)}</code>",
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
-    if data == "schL":
-        await _render_schedule_list(chat_id, q, ws_tf)
         return
 
     if data.startswith("schs:"):
+        update_chat(c_id, ws_sf, pending_edit={})
         tid = data.split(":", 1)[1]
         await _render_schedule_detail(q, tid, ws_tf)
+        return
+
+    if data.startswith("sidset:"):
+        update_chat(c_id, ws_sf, pending_edit={})
+        s_id = data.split(":", 1)[1]
+        update_chat(c_id, ws_sf, session_id=s_id)
+        s_esc = html.escape(s_id)
+        kb = [[InlineKeyboardButton("⬅️ Back", callback_data="st:back")]]
+        await q.edit_message_text(
+            f"{E.OK} <b>Session switched</b>\n"
+            f"{E.SESS} <code>{s_esc}</code>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(kb),
+        )
         return
 
     if data.startswith("schd:"):
@@ -2025,7 +2665,11 @@ async def _on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE)
             del tasks[tid]
             _save_scheduled_tasks(tasks, tf)
             _reschedule_all_tasks(tasks)
-            await q.edit_message_text(f"{E.OK} Deleted <code>{html.escape(tid)}</code>", parse_mode=ParseMode.HTML)
+            t_esc = html.escape(tid)
+            await q.edit_message_text(
+                f"{E.OK} Deleted <code>{t_esc}</code>",
+                parse_mode=ParseMode.HTML
+            )
         else:
             await q.edit_message_text(f"{E.ERR} Task not found.")
         return
@@ -2041,17 +2685,26 @@ async def _on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await q.edit_message_text(f"{E.ERR} Invalid edit action")
             return
         tid, field = parts[1], parts[2]
-        update_chat(chat_id, ws_sf, pending_edit={"type": "schedule", "task_id": tid, "field": field})
+        p_edit = {
+            "type": "schedule", "task_id": tid, "field": field
+        }
+        update_chat(c_id, ws_sf, pending_edit=p_edit)
         if field == "time":
-            hint = "Send new time format, e.g. `every 2 hours` / `daily 09:30` / `at 18:00` / `after 30 minutes`"
+            hint = (
+                "Send new time format, e.g. `every 2 hours` / "
+                "`daily 09:30` / `at 18:00` / `after 30 minutes`"
+            )
         elif field == "name":
             hint = "Send new task name text."
         else:
             hint = "Send new task content/prompt text."
+        f_esc = html.escape(field)
+        kb = [[InlineKeyboardButton("Cancel", callback_data=f"schs:{tid}")]]
         await q.edit_message_text(
-            f"{E.WAIT} <b>Waiting for new {html.escape(field)}...</b>\n{hint}\n\nThis will overwrite the original value.",
+            f"{E.WAIT} <b>Waiting for new {f_esc}...</b>\n{hint}\n\n"
+            "This will overwrite the original value.",
             parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Cancel", callback_data=f"schs:{tid}")]]),
+            reply_markup=InlineKeyboardMarkup(kb),
         )
         return
 
@@ -2069,14 +2722,26 @@ async def _on_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE)
             return
 
         if mode == "i":
-            info["schedule"] = {"type": "interval", "interval": int(a), "unit": b, "task": info.get("task", "")}
+            info["schedule"] = {
+                "type": "interval", "interval": int(a),
+                "unit": b, "task": info.get("task", "")
+            }
         elif mode == "d":
-            info["schedule"] = {"type": "daily", "hour": int(a), "minute": int(b), "task": info.get("task", "")}
+            info["schedule"] = {
+                "type": "daily", "hour": int(a),
+                "minute": int(b), "task": info.get("task", "")
+            }
         elif mode == "o":
             now = datetime.now()
-            delta = timedelta(minutes=int(a)) if b == "minutes" else timedelta(hours=int(a))
+            if b == "minutes":
+                delta = timedelta(minutes=int(a))
+            else:
+                delta = timedelta(hours=int(a))
             target = now + delta
-            info["schedule"] = {"type": "once", "hour": target.hour, "minute": target.minute, "task": info.get("task", "")}
+            info["schedule"] = {
+                "type": "once", "hour": target.hour,
+                "minute": target.minute, "task": info.get("task", "")
+            }
         else:
             await q.edit_message_text(f"{E.ERR} Unknown edit mode")
             return
@@ -2120,8 +2785,12 @@ async def _render_schedule_list(chat_id: int, message_obj, ws_tf):
     if task_map:
         for tid, pair in list(task_map.items())[:20]:
             info, _tf = pair
-            rows.append([InlineKeyboardButton(_task_label(tid, info), callback_data=f"schs:{tid}")])
+            label = _task_label(tid, info)
+            cb = f"schs:{tid}"
+            rows.append([InlineKeyboardButton(label, callback_data=cb)])
     rows.append([InlineKeyboardButton("Refresh", callback_data="schL")])
+    b_st = InlineKeyboardButton("⬅️ Back to Status", callback_data="st:back")
+    rows.append([b_st])
 
     text = (
         f"{E.TIME} <b>Scheduled tasks</b>\nTap one to edit/delete."
@@ -2148,7 +2817,8 @@ async def _render_schedule_list(chat_id: int, message_obj, ws_tf):
                 )
                 return
             except Exception:
-                print(f"  [_render_schedule_list callback fallback failed: {e}]")
+                err_msg = f"  [_render_schedule_list callback failed: {e}]"
+                print(err_msg)
                 return
 
     # Normal Message path (/scheduled command)
@@ -2172,18 +2842,28 @@ async def _render_schedule_detail(q, task_id: str, ws_tf):
     tf, tasks = _find_task_file(task_id, ws_tf)
     info = tasks.get(task_id)
     if not info:
-        await q.edit_message_text(f"{E.ERR} Task not found: <code>{html.escape(task_id)}</code>", parse_mode=ParseMode.HTML)
+        t_esc = html.escape(task_id)
+        await q.edit_message_text(
+            f"{E.ERR} Task not found: <code>{t_esc}</code>",
+            parse_mode=ParseMode.HTML
+        )
         return
     desc = _schedule_desc(info)
-    task_name = html.escape((info.get("name", "") or "(no name)")[:120])
+    t_name = html.escape((info.get("name", "") or "(no name)")[:120])
     task_text = html.escape((info.get("task", "") or "")[:200])
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🗑 Delete", callback_data=f"schd:{task_id}"), InlineKeyboardButton("✏️ Edit", callback_data=f"sche:{task_id}")],
+    kb_list = [
+        [
+            InlineKeyboardButton(
+                "🗑 Delete", callback_data=f"schd:{task_id}"
+            ),
+            InlineKeyboardButton("✏️ Edit", callback_data=f"sche:{task_id}")
+        ],
         [InlineKeyboardButton("⬅️ Back", callback_data="schL")],
-    ])
+    ]
+    kb = InlineKeyboardMarkup(kb_list)
     await q.edit_message_text(
         f"{E.TIME} <b>Task</b> <code>{html.escape(task_id)}</code>\n"
-        f"Name: <b>{task_name}</b>\n"
+        f"Name: <b>{t_name}</b>\n"
         f"Schedule: <b>{html.escape(desc)}</b>\n"
         f"Prompt: <code>{task_text}</code>",
         parse_mode=ParseMode.HTML,
@@ -2196,12 +2876,14 @@ async def _render_schedule_edit_menu(q, task_id: str, ws_tf):
     if task_id not in tasks:
         await q.edit_message_text(f"{E.ERR} Task not found.")
         return
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Edit name", callback_data=f"schef:{task_id}:name")],
-        [InlineKeyboardButton("Edit time", callback_data=f"schef:{task_id}:time")],
-        [InlineKeyboardButton("Edit content", callback_data=f"schef:{task_id}:task")],
-        [InlineKeyboardButton("⬅️ Back", callback_data=f"schs:{task_id}")],
-    ])
+    bt = InlineKeyboardButton
+    kbl = [
+        [bt("Edit name", callback_data=f"schef:{task_id}:name")],
+        [bt("Edit time", callback_data=f"schef:{task_id}:time")],
+        [bt("Edit content", callback_data=f"schef:{task_id}:task")],
+        [bt("⬅️ Back", callback_data=f"schs:{task_id}")],
+    ]
+    kb = InlineKeyboardMarkup(kbl)
     await q.edit_message_text(
         f"{E.TOOL} <b>Edit task</b>\nChoose what to edit:",
         parse_mode=ParseMode.HTML,
@@ -2215,9 +2897,11 @@ def _reschedule_all_tasks(tasks: Optional[Dict] = None):
     for _cid, ws_cfg in CHANNEL_WORKSPACES.items():
         n = ws_cfg.get("name")
         if n:
-            all_task_files.add(str(SCRIPT_DIR / f"hpc_relay_tasks_{n}.json"))
+            n_file = f"hpc_relay_tasks_{n}.json"
+            all_task_files.add(str(SCRIPT_DIR / n_file))
     if AUTO_WORKSPACE_PER_CHAT:
-        for tf in SCRIPT_DIR.glob(f"hpc_relay_tasks_{AUTO_WORKSPACE_PREFIX}_*.json"):
+        glob_p = f"hpc_relay_tasks_{AUTO_WORKSPACE_PREFIX}_*.json"
+        for tf in SCRIPT_DIR.glob(glob_p):
             all_task_files.add(str(tf))
     for tf in all_task_files:
         for tid, tinfo in _load_scheduled_tasks(tf).items():
@@ -2225,63 +2909,84 @@ def _reschedule_all_tasks(tasks: Optional[Dict] = None):
             _schedule_job(tid, tinfo)
 
 
-async def _cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _is_allowed_update(update):
-        return
-    chat_id = update.effective_chat.id
-    uid = update.effective_user.id if update.effective_user else None
-    ws = _resolve_workspace(chat_id, uid)
+async def _render_status(message_obj, chat_id, uid, ws, is_callback=False):
     ws_sf = ws["sessions_file"]
     ws_tf = ws["tasks_file"]
     ws_wd = ws["workdir"]
     ws_name = ws.get("name") or "default"
+
+    t0 = time.time()
+    wait = None
+    if not is_callback:
+        wait = await message_obj.reply_text(f"{E.WAIT} Gathering status...")
+
+    _hpc_sessions = await _fetch_hpc_sessions()
+    t_sess = time.time() - t0
+
+    if wait:
+        await _delete_or_check(wait)
+
     chat = get_chat(chat_id, ws_sf)
     model = chat.get("model", DEFAULT_MODEL)
     sid = _display_sid(chat.get("session_id"))
-    known = len(_get_known_sessions(ws_sf))
-    tasks = len(_load_scheduled_tasks(ws_tf))
+    known = len(_hpc_sessions)
+    tasks = _chat_task_count(chat_id, ws_tf)
 
     pending = chat.get("pending_edit")
     if pending:
-        pending_txt = f"active ({pending.get('task_id','?')} / {pending.get('field','?')})"
+        p_tid = pending.get('task_id', '?')
+        p_fld = pending.get('field', '?')
+        pending_txt = f"active ({p_tid} / {p_fld})"
     else:
         pending_txt = "none"
-
-    wait = await update.message.reply_text(f"{E.WAIT} Gathering status...")
-    stats = await _opencode_stats_summary(days=7)
-    await _delete_or_check(wait)
 
     lines = [
         "📌 <b>Relay Status</b>",
         f"🤖 <b>Model ID:</b> <code>{html.escape(model)}</code>",
     ]
 
-    # Hide empty session from status output
     if sid and sid != "new session" and sid.lower() != "none":
         lines.append(f"🧵 <b>Session ID:</b> <code>{html.escape(sid)}</code>")
 
     lines += [
-        f"🧩 <b>Workspace:</b> <code>{html.escape(ws_name)}</code>",
-        f"📁 <b>Workdir:</b> <code>{html.escape(ws_wd)}</code>",
-        f"🗂 <b>Known Sessions:</b> <code>{known}</code>",
-        f"⏰ <b>Scheduled Tasks:</b> <code>{tasks}</code>",
-        f"📝 <b>Pending edit:</b> <code>{html.escape(pending_txt)}</code>",
+        f"🧩 <b>WS:</b> <code>{html.escape(ws_name)}</code>",
+        f"📁 <b>Dir:</b> <code>{html.escape(ws_wd)}</code>",
+        f"🗂 <b>Sessions:</b> <code>{known}</code>",
+        f"⏰ <b>Tasks:</b> <code>{tasks}</code>",
+        f"📝 <b>Edit:</b> <code>{html.escape(pending_txt)}</code>",
     ]
 
-    if stats:
-        lines += [
-            "",
-            "📊 <b>OpenCode Stats (7d)</b>",
-            f"• Sessions: <code>{html.escape(stats.get('sessions','?'))}</code> | Messages: <code>{html.escape(stats.get('messages','?'))}</code>",
-            f"• Input: <code>{html.escape(stats.get('input','?'))}</code> | Output: <code>{html.escape(stats.get('output','?'))}</code>",
-            f"• Cache R/W: <code>{html.escape(stats.get('cache_read','?'))}</code> / <code>{html.escape(stats.get('cache_write','?'))}</code>",
-            f"• Avg tokens/session: <code>{html.escape(stats.get('avg_tokens_session','?'))}</code>",
-            f"• Total cost: <code>${html.escape(stats.get('total_cost','0.00'))}</code>",
-        ]
-        if stats.get("top_model"):
-            lines.append(f"• Top model: <code>{html.escape(stats['top_model'])}</code>")
+    footer = f"\n<i>Sessions fetch: {t_sess:.1f}s</i>"
+    lines.append(footer)
 
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+    kb = [
+        [
+            InlineKeyboardButton("🗂 Sessions", callback_data="st:id"),
+            InlineKeyboardButton("⏰ Tasks", callback_data="st:sch"),
+        ]
+    ]
+
+    if is_callback:
+        await message_obj.edit_text(
+            "\n".join(lines),
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(kb),
+        )
+    else:
+        await message_obj.reply_text(
+            "\n".join(lines),
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(kb),
+        )
+
+
+async def _cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_allowed_update(update):
+        return
+    c_id = update.effective_chat.id
+    u_id = update.effective_user.id if update.effective_user else None
+    ws = _resolve_workspace(c_id, u_id)
+    await _render_status(update.message, c_id, u_id, ws)
 
 
 # ================================================================
@@ -2298,18 +3003,28 @@ async def _cmd_debugws(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ws_wd = ws["workdir"]
     ws_name = ws.get("name") or "default"
     chat = get_chat(chat_id, ws_sf)
+    s_id = str(chat.get('session_id'))
+    m_name = chat.get('model', DEFAULT_MODEL)
+    s_cnt = len(_load_scheduled_tasks(ws_tf))
+    c_cnt = len(_collect_chat_tasks(chat_id, ws_tf))
+    m_esc = html.escape(m_name or DEFAULT_MODEL)
+    s_id_str = str(s_id)
+    s_esc = html.escape(s_id_str)
+    w_esc = html.escape(ws_name)
+    d_esc = html.escape(ws_wd)
+    s_esc = html.escape(ws_sf)
+    t_esc = html.escape(ws_tf)
     text = (
-        "🧪 <b>Workspace Debug</b>\n"
-        f"chat_id: <code>{chat_id}</code>\n"
-        f"user_id: <code>{uid}</code>\n"
-        f"workspace: <code>{html.escape(ws_name)}</code>\n"
-        f"workdir: <code>{html.escape(ws_wd)}</code>\n"
-        f"sessions_file: <code>{html.escape(ws_sf)}</code>\n"
-        f"tasks_file: <code>{html.escape(ws_tf)}</code>\n"
-        f"model: <code>{html.escape(chat.get('model', DEFAULT_MODEL))}</code>\n"
-        f"session_id: <code>{html.escape(str(chat.get('session_id')))}</code>\n"
-        f"scheduled_count: <code>{len(_load_scheduled_tasks(ws_tf))}</code>\n"
-        f"scheduled_count_chat_any_file: <code>{len(_collect_chat_tasks(chat_id, ws_tf))}</code>"
+        "🧪 <b>WS Debug</b>\n"
+        f"chat: <code>{chat_id}</code>\n"
+        f"user: <code>{uid}</code>\n"
+        f"ws: <code>{w_esc}</code>\n"
+        f"dir: <code>{d_esc}</code>\n"
+        f"sf: <code>{s_esc}</code>\n"
+        f"tf: <code>{t_esc}</code>\n"
+        f"mdl: <code>{m_esc}</code>\n"
+        f"sid: <code>{s_esc}</code>\n"
+        f"sc: <code>{s_cnt}</code> | cs: <code>{c_cnt}</code>"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
@@ -2331,7 +3046,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         print(f"  BLOCKED: user {uid} not in workspace allowed_users")
         return
 
-    raw, attached_files = await _extract_user_prompt_and_files(update, context, chat_id)
+    res = await _extract_user_prompt_and_files(update, context, chat_id)
+    raw, attached_files = res
     if not raw and not attached_files:
         return
     if attached_files and not raw:
@@ -2352,13 +3068,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             info = tasks.get(task_id)
             if not info:
                 update_chat(chat_id, ws_sf, pending_edit={})
-                await update.message.reply_text(f"{E.ERR} Task not found anymore.")
+                m_txt = f"{E.ERR} Task not found anymore."
+                await update.message.reply_text(m_txt)
                 return
             if field == "time":
                 parsed = _parse_schedule_text(raw, info.get("task", ""))
                 if not parsed:
                     await update.message.reply_text(
-                        f"{E.ERR} Invalid time format. Try: `every 2 hours` / `daily 09:30` / `at 18:00` / `after 30 minutes`"
+                        f"{E.ERR} Invalid format. Try:\n"
+                        "`every 2 hours` / `daily 09:30` / "
+                        "`at 18:00` / `after 2 min`"
                     )
                     return
                 info["schedule"] = parsed
@@ -2373,82 +3092,161 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _save_scheduled_tasks(tasks, tf)
             _reschedule_all_tasks(tasks)
             update_chat(chat_id, ws_sf, pending_edit={})
-            await update.message.reply_text(f"{E.OK} Updated <code>{html.escape(task_id)}</code> ({html.escape(field)} overwritten).", parse_mode=ParseMode.HTML)
+            t_esc = html.escape(task_id)
+            f_esc = html.escape(field)
+            p_o = f"({f_esc} overwritten)."
+            await update.message.reply_text(
+                f"{E.OK} Updated <code>{t_esc}</code> {p_o}",
+                parse_mode=ParseMode.HTML
+            )
             return
 
-    # Check mention
+    is_preempt = False
+
+    # Check mention / priority override
     if raw.startswith("@"):
         bot_username = context.bot.username
         m_mention = re.match(r"^@(\w+)", raw)
         if m_mention:
             mentioned = m_mention.group(1)
-            # If not talking to us, ignore silently
-            if bot_username and mentioned.lower() != bot_username.lower():
-                return
-            # Strip our mention
-            raw = re.sub(r"^@\w+\s*", "", raw).strip()
-            if not raw:
-                # empty message after stripping
-                return
+            if bot_username and mentioned.lower() == bot_username.lower():
+                raw = re.sub(r"^@\w+\s*", "", raw).strip()
+                if not raw:
+                    return
+            else:
+                is_preempt = True
 
     # Fast-path kill command without backgrounding
     if raw.lower() in ("!kill", "/kill", "/q"):
-        update_chat(chat_id, ws_sf, kill_requested="yes", running=False)
+        chat = get_chat(chat_id, ws_sf)
+        killed = _kill_session_processes(
+            chat.get("session_id"), ws.get("workdir")
+        )
+        update_chat(
+            chat_id, ws_sf, kill_requested="yes", running=False,
+            running_started=0, running_prompt="", pending_messages=[]
+        )
         try:
+            extra = ""
+            if killed:
+                extra = f" Killed {killed} lingering proc(s)."
             await update.message.reply_text(
-                f"{E.OK} Kill signal sent. Running processes will terminate."
+                f"{E.OK} Kill-all sent. Cleared queue.{extra}"
             )
         except Exception:
             pass
         return
 
-    # Prevent concurrent opencode runs in the same chat (avoids DB/session lock errors)
+    # Prevent concurrent opencode runs in the same chat
+    # (avoids DB/session lock errors)
+    _clear_stale_running_sessions(ws_sf)
     chat_now = get_chat(chat_id, ws_sf)
     if chat_now.get("running"):
-        try:
-            await update.message.reply_text(
-                f"{E.WARN} 上一个任务还在运行中（之前可能已发 partial）。\n"
-                f"请等它结束，或发 <code>/kill</code> 终止后再发下一条。",
-                parse_mode=ParseMode.HTML,
-            )
-        except Exception:
-            pass
+        _queue_message(chat_id, ws_sf, raw, attached_files, preempt=is_preempt)
         return
 
     # Dispatch to background task so the bot immediately accepts new messages
-    asyncio.create_task(_run_in_background(update, context, chat_id, raw, ws, attached_files))
+    asyncio.create_task(
+        _run_in_background(
+            update, context, chat_id, raw, ws, attached_files
+        )
+    )
 
 
-async def _run_in_background(update, context, chat_id, raw, ws, attached_files=None):
-    update_chat(chat_id, ws["sessions_file"], running=True, running_started=int(time.time()), running_prompt=(raw or "")[:120])
+async def _typing_loop(context, chat_id, done_event):
+    while not done_event.is_set():
+        try:
+            await context.bot.send_chat_action(
+                chat_id=chat_id, action=ChatAction.TYPING
+            )
+        except Exception:
+            pass
+        try:
+            await asyncio.wait_for(done_event.wait(), timeout=4.0)
+        except asyncio.TimeoutError:
+            continue
+
+
+async def _run_in_background(
+    update, context, chat_id, raw, ws, attached_files=None
+):
+    done_event = asyncio.Event()
+    typing_task = asyncio.create_task(
+        _typing_loop(context, chat_id, done_event)
+    )
+    ts = int(time.time())
+    p_cap = (raw or "")[:120]
+    update_chat(
+        chat_id, ws["sessions_file"], running=True,
+        running_started=ts, running_prompt=p_cap
+    )
     try:
-        await _handle_message_inner(update, context, chat_id, raw, ws, attached_files)
+        await _handle_message_inner(
+            update, context, chat_id, raw, ws, attached_files
+        )
     except Exception as exc:
         tb = traceback.format_exc()
         print(f"  UNHANDLED ERROR:\n{tb}")
         try:
-            await update.message.reply_text(
-                f"{E.ERR} Internal error (see server log):\n{type(exc).__name__}: {str(exc)[:200]}"
-            )
+            exc_t = type(exc).__name__
+            exc_s = str(exc)[:200]
+            err_m = f"{E.ERR} Internal error:\n{exc_t}: {exc_s}"
+            await update.message.reply_text(err_m)
         except Exception:
             pass
     finally:
-        update_chat(chat_id, ws["sessions_file"], running=False, running_started=0, running_prompt="")
+        done_event.set()
+        try:
+            await typing_task
+        except Exception:
+            pass
+        update_chat(
+            chat_id, ws["sessions_file"], running=False,
+            running_started=0, running_prompt=""
+        )
+        nxt = _pop_next_message(chat_id, ws["sessions_file"])
+        if nxt:
+            n_raw = nxt.get("raw", "")
+            n_att = nxt.get("attached_files") or []
+            print(
+                f"  [QUEUE] Dequeued for chat={chat_id}: "
+                f"preempt={bool(nxt.get('preempt'))} id={nxt.get('id')}"
+            )
+            asyncio.create_task(
+                _run_in_background(update, context, chat_id, n_raw, ws, n_att)
+            )
 
 
-async def _handle_message_inner(update, context, chat_id, raw, ws, attached_files=None):
+async def _handle_message_inner(
+    update, context, chat_id, raw, ws, attached_files=None
+):
     ws_tf = ws["tasks_file"]
     ws_sf = ws["sessions_file"]
     ws_wd = ws["workdir"]
     ws_suffix = ws["system_suffix"]
     ws_name = ws.get("name") or "default"
-    print(f"  workspace={ws_name}  workdir={ws_wd}")
+    print(f"  workspace={ws_name}")
+    print(f"  workdir={ws_wd}")
     # Scheduled management is handled via /scheduled command.
 
     parsed = parse_message(raw)
     chat = get_chat(chat_id, ws_sf)
     model = chat["model"]
     sid = chat["session_id"]
+    known_sessions = set(_get_known_sessions(ws_sf) or [])
+    sid_ok = (
+        sid and sid != "__new__"
+        and sid.startswith("ses") and sid in known_sessions
+    )
+    if sid_ok:
+        exists_here = await _session_exists_on_this_host(sid)
+        if not exists_here:
+            print(
+                f"  [SESSION RESET] known session {sid} missing here; "
+                "switching to __new__"
+            )
+            update_chat(chat_id, ws_sf, session_id="__new__")
+            sid = "__new__"
     print(f"  model={model}  session={sid}")
 
     # -- SHELL --
@@ -2464,7 +3262,8 @@ async def _handle_message_inner(update, context, chat_id, raw, ws, attached_file
         hdr = _shell_header_html()
         body = f"<pre>{html.escape(out[:3500])}</pre>"
         await _send_html(update, hdr + body)
-        await _delete_or_check(status_msg)
+        if status_msg is not None:
+            await _delete_or_check(status_msg)
         return
 
     # -- OPENCODE --
@@ -2476,10 +3275,9 @@ async def _handle_message_inner(update, context, chat_id, raw, ws, attached_file
     if not parsed.get("prompt"):
         return
     prompt = parsed["prompt"] + ws_suffix
-    status_label = f"{E.WAIT} Connecting to HPC..."
-    if attached_files:
-        status_label += f"\nAttached image(s): {len(attached_files)}"
-    status_msg = await update.message.reply_text(status_label)
+    status_msg = None
+    tool_msg = None
+    stream_msg = None
 
     text_buf = []
     last_edit_t = 0.0
@@ -2488,14 +3286,55 @@ async def _handle_message_inner(update, context, chat_id, raw, ws, attached_file
     partial_sent_len = 0
     done_event = asyncio.Event()
 
+    async def _ensure_status_msg(initial_text=None):
+        nonlocal status_msg
+        if status_msg is None:
+            status_msg = await update.message.reply_text(
+                initial_text or f"{E.WAIT} Continuing...",
+                parse_mode=ParseMode.HTML
+            )
+        return status_msg
+
+    async def _show_tool_call(text_line):
+        nonlocal tool_msg
+        if not text_line:
+            return
+        if tool_msg is None:
+            tool_msg = await update.message.reply_text(text_line)
+        else:
+            await _safe_edit(tool_msg, text_line)
+
+    async def _show_stream_text(text_line):
+        nonlocal stream_msg
+        if not text_line:
+            return
+        if stream_msg is None:
+            stream_msg = await update.message.reply_text(text_line)
+        else:
+            await _safe_edit(stream_msg, text_line)
+        return stream_msg
+
     async def on_progress(s):
         nonlocal last_edit_t, last_output_t
         last_output_t = time.time()
         now = time.time()
-        if now - last_edit_t < 1.0:
+        elapsed = int(now - start_t)
+        low = (s or '').lower()
+        boring = (
+            'still processing', 'streaming', 'connected -- waiting',
+            'started', 'running '
+        )
+        if any(b in low for b in boring):
             return
-        last_edit_t = now
-        await _safe_edit(status_msg, f"{s} [{int(now - start_t)}s]")
+        if '🛠' in s or s.startswith(f"{E.TOOL}") or 'subagent' in low:
+            await _show_tool_call(s)
+            return
+        if elapsed >= 120:
+            smsg = await _ensure_status_msg(f"{elapsed}s")
+            if now - last_edit_t < 1.0:
+                return
+            last_edit_t = now
+            await _safe_edit(smsg, f"{s} [{elapsed}s]")
 
     async def on_text_chunk(delta):
         nonlocal last_edit_t, last_output_t
@@ -2540,14 +3379,14 @@ async def _handle_message_inner(update, context, chat_id, raw, ws, attached_file
                     body = md_to_tg_html(joined)
                     await _send_html(
                         update,
-                        hdr
-                        + body
-                        + f"\n\n{E.WARN} <i>Partial at {elapsed}s (still running)</i>",
+                        hdr + body
+                        + f"\n\n{E.WARN} <i>Partial at {elapsed}s "
+                        "(still running)</i>",
                     )
                 await _safe_edit(
                     status_msg,
-                    f"{E.WARN} Running {elapsed}s | buf {chars} chars | silent {int(silence)}s\n"
-                    f"Send /kill to stop.",
+                    f"{chars} chars buffered, silent {int(silence)}s\n"
+                    "Send /kill to stop.",
                 )
                 continue
 
@@ -2565,11 +3404,14 @@ async def _handle_message_inner(update, context, chat_id, raw, ws, attached_file
                         _display_sid(cur_sid, is_new=(effective_sid is None)),
                     )
                     body = md_to_tg_html(joined)
-                    await _send_html(
-                        update,
-                        hdr
-                        + body
-                        + f"\n\n{E.TIME} <i>Stall: {int(silence)}s silence, {elapsed}s total</i>",
+                    t_f = (
+                        hdr + body
+                        + f"\n\n{E.TIME} <i>Stall: {silence:.0f}s silence, "
+                        + f"{elapsed}s total</i>"
+                    )
+                    await _send_html(update, t_f)
+                    await _ensure_status_msg(
+                        f"{E.WAIT} Continuing... [{elapsed}s]"
                     )
                     await _safe_edit(
                         status_msg, f"{E.OUT} Partial sent [{elapsed}s]"
@@ -2579,17 +3421,35 @@ async def _handle_message_inner(update, context, chat_id, raw, ws, attached_file
                 chars = len("".join(text_buf))
                 kill_hint = "\nSend /kill to stop."
                 if partial_sent_len > 0:
-                    st = f"{E.WARN} Silent {int(silence)}s (total: {elapsed}s)\nPartial sent ({partial_sent_len} chars){kill_hint}"
+                    st = (
+                        f"{E.WARN} Silent {int(silence)}s "
+                        f"(total: {elapsed}s)\n"
+                        f"Partial sent ({partial_sent_len} chars)"
+                        f"{kill_hint}"
+                    )
                 else:
-                    st = f"{E.WARN} Silent {int(silence)}s (total: {elapsed}s)\nBuffered: {chars} chars{kill_hint}"
+                    st = (
+                        f"{E.WARN} Silent {int(silence)}s "
+                        f"(total: {elapsed}s)\n"
+                        f"Buffered: {chars} chars{kill_hint}"
+                    )
+                m_c = f"{E.WAIT} Continuing... [{elapsed}s]"
+                await _ensure_status_msg(m_c)
                 await _safe_edit(status_msg, st)
 
     monitor = asyncio.create_task(stall_monitor())
     try:
         final, new_sid = await run_opencode(
-            prompt, chat_id, model, effective_sid, on_progress, on_text_chunk, attached_files,
-            workdir=ws_wd, sessions_file=ws_sf
+            prompt, chat_id, model, effective_sid, on_progress,
+            on_text_chunk, attached_files, workdir=ws_wd,
+            sessions_file=ws_sf
         )
+        if final == QUEUE_PREEMPT_MARKER:
+            done_event.set()
+            monitor.cancel()
+            if status_msg is not None:
+                await _delete_or_check(status_msg)
+            return
     except subprocess.TimeoutExpired:
         joined = "".join(text_buf)
         if joined.strip() and partial_sent_len == 0:
@@ -2622,7 +3482,7 @@ async def _handle_message_inner(update, context, chat_id, raw, ws, attached_file
                 update,
                 hdr
                 + body
-                + f"\n\n{E.ERR} <i>Process terminated, partial output above</i>",
+                + f"\n\n{E.ERR} <i>Terminated, partial output above</i>",
             )
         final = f"{E.ERR} {type(e).__name__}:{str(e)[:200]}"
         if joined.strip():
@@ -2638,7 +3498,7 @@ async def _handle_message_inner(update, context, chat_id, raw, ws, attached_file
         except asyncio.CancelledError:
             pass
 
-    # Persist latest model used for this session so switching back restores model.
+    # Persist latest model for session
     used_sid = new_sid or effective_sid
     if isinstance(used_sid, str) and used_sid.startswith("ses"):
         _set_session_model(used_sid, model, ws_sf)
@@ -2651,7 +3511,8 @@ async def _handle_message_inner(update, context, chat_id, raw, ws, attached_file
 
     header = _header_html(model, display_sid)
     elapsed = int(time.time() - start_t)
-    print(f"  REPLY ({len(final)} chars, {elapsed}s):{final[:200]!r}")
+    f_len = len(final)
+    print(f"  REPLY ({f_len} chars, {elapsed}s):{final[:200]!r}")
 
     body_html = md_to_tg_html(final)
 
@@ -2661,13 +3522,14 @@ async def _handle_message_inner(update, context, chat_id, raw, ws, attached_file
             final_msg = md_to_tg_html(remaining)
         else:
             final_msg = (
-                header
-                + f"\n\n{E.OK} <b>[Finished]</b> ({elapsed}s) \u2014 see partial above."
+                header + "\n\n" + E.OK + " <b>[Finished]</b> ("
+                + str(elapsed) + "s) \u2014 see partial above."
             )
     elif partial_sent_len > 0:
         final_msg = (
             header
-            + f"\n\n{E.OK} <b>[Finished]</b> ({elapsed}s) \u2014 see partial above."
+            + f"\n\n{E.OK} <b>[Finished]</b> ({elapsed}s) "
+            " \u2014 see partial above."
         )
     else:
         final_msg = body_html
@@ -2684,9 +3546,23 @@ async def _handle_message_inner(update, context, chat_id, raw, ws, attached_file
             task_prompt = parts[1].strip()
 
             task_info = None
-            if time_expr.startswith("every "):
+            # "every day at HH:MM" or "daily at HH:MM"
+            re_d = (
+                r"(?:every\s+day\s+(?:at\s+)?|daily\s+(?:at\s+)?)"
+                r"(\d{1,2}):(\d{2})"
+            )
+            m_daily = re.match(re_d, time_expr)
+            if m_daily:
+                task_info = {
+                    "type": "daily",
+                    "hour": int(m_daily.group(1)),
+                    "minute": int(m_daily.group(2)),
+                    "task": task_prompt,
+                }
+            elif time_expr.startswith("every "):
                 m_int = re.match(
-                    r"every\s+(\d+)\s+(minute|hour|day)", time_expr
+                    r"every\s+(\d+)\s+(minute|hour|day)",
+                    time_expr,
                 )
                 if m_int:
                     task_info = {
@@ -2696,7 +3572,9 @@ async def _handle_message_inner(update, context, chat_id, raw, ws, attached_file
                         "task": task_prompt,
                     }
             elif time_expr.startswith("at "):
-                m_at = re.match(r"at\s+(\d{1,2}):(\d{2})", time_expr)
+                m_at = re.match(
+                    r"at\s+(\d{1,2}):(\d{2})", time_expr
+                )
                 if m_at:
                     task_info = {
                         "type": "daily",
@@ -2740,17 +3618,23 @@ async def _handle_message_inner(update, context, chat_id, raw, ws, attached_file
                 _schedule_job(task_id, tasks[task_id])
 
                 if task_info["type"] == "interval":
-                    desc = f"every {task_info['interval']} {task_info['unit']}"
+                    ti_u = task_info['unit']
+                    desc = f"every {task_info['interval']} {ti_u}"
                 elif task_info["type"] == "daily":
-                    desc = f"daily at {task_info['hour']:02d}:{task_info['minute']:02d}"
+                    ti_h = task_info['hour']
+                    ti_m = task_info['minute']
+                    desc = f"daily at {ti_h:02d}:{ti_m:02d}"
                 else:
-                    desc = f"once at {task_info['hour']:02d}:{task_info['minute']:02d}"
-                scheduled_hint += (
+                    ti_h = task_info['hour']
+                    ti_m = task_info['minute']
+                    desc = f"once at {ti_h:02d}:{ti_m:02d}"
+                s_hint = (
                     f"\n\n{E.OK} <b>Scheduled Task Added!</b>\n"
                     f"{E.TIME} {desc}\n"
                     f"{E.TOOL} Task:<code>"
                     f"{html.escape(task_prompt[:50])}</code>"
                 )
+                scheduled_hint += s_hint
 
     await _send_html(update, final_msg + scheduled_hint)
     await _delete_or_check(status_msg)
@@ -2774,13 +3658,14 @@ def main():
 
     async def on_startup(app):
         set_app_context(app, asyncio.get_event_loop())
+        _clear_stale_running_sessions()
         await app.bot.set_my_commands([
             BotCommand("model", "Select model (provider -> model)"),
             BotCommand("new", "Start a new session"),
             BotCommand("id", "Switch to session id or pick recent"),
             BotCommand("send", "Send file(s) from HPC/local workspace"),
             BotCommand("upload", "Upload file(s) via rclone destination"),
-            BotCommand("status", "Show current model/session and runtime status"),
+            BotCommand("status", "Show bot & runtime status"),
             BotCommand("debugws", "Show workspace/session/task file mapping"),
             BotCommand("scheduled", "Manage scheduled tasks (edit/delete)"),
             BotCommand("kill", "Stop current running task"),
@@ -2799,11 +3684,16 @@ def main():
     app.add_handler(CommandHandler("kill", _cmd_kill))
     app.add_handler(CommandHandler("q", _cmd_q))
     app.add_handler(CallbackQueryHandler(_on_callback_query))
+    inbound_filter = (
+        filters.TEXT
+        | filters.PHOTO
+        | filters.Document.IMAGE
+        | filters.VOICE
+        | filters.AUDIO
+        | filters.VIDEO_NOTE
+    ) & ~filters.COMMAND
     app.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
-    )
-    app.add_handler(
-        MessageHandler((filters.PHOTO | filters.Document.IMAGE) & ~filters.COMMAND, handle_message)
+        MessageHandler(inbound_filter, handle_message)
     )
     print("Bot started -- polling...")
     app.run_polling()

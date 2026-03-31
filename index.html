@@ -4,12 +4,12 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta property="og:title" content="HPC-Relay -- AI on Your HPC, WSL, or macOS, From Your Phone">
+  <meta property="og:title" content="OpencodeClaw -- AI on Your HPC, WSL, or macOS, From Your Phone">
   <meta property="og:description"
     content="Control AI coding agents on HPC clusters, WSL setups, or lab macOS machines via Telegram. Transfer files, switch models, manage sessions. No VPN needed.">
   <meta property="og:type" content="website">
   <meta name="twitter:card" content="summary_large_image">
-  <title>HPC-Relay -- AI on Your HPC, WSL, or macOS, From Your Phone</title>
+  <title>OpencodeClaw -- AI on Your HPC, WSL, or macOS, From Your Phone</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link
@@ -951,7 +951,7 @@
     <div class="inner">
       <div class="nav-logo">
         <div class="dot"></div>
-        hpc-relay
+        OpencodeClaw
       </div>
       <div class="nav-links">
         <a href="#features">Features</a>
@@ -959,7 +959,7 @@
         <a href="#models">Models</a>
         <a href="#setup">Setup</a>
         <a href="#hpc-practices">HPC Tips</a>
-        <a href="https://github.com/MichaelG0501/hpc-relay" target="_blank">GitHub</a>
+        <a href="https://github.com/MichaelG0501/OpencodeClaw" target="_blank">GitHub</a>
       </div>
     </div>
   </nav>
@@ -979,7 +979,7 @@
         lauch jobs, debug and check results, simply send a message. Built for researchers and bioinformaticians.
       </p>
       <div class="hero-actions">
-        <a href="https://github.com/MichaelG0501/hpc-relay" class="btn-primary" target="_blank">
+        <a href="https://github.com/MichaelG0501/OpencodeClaw" class="btn-primary" target="_blank">
           Star on GitHub
         </a>
         <a href="#setup" class="btn-secondary">
@@ -1116,13 +1116,13 @@
     <div class="container">
       <div class="section-label reveal">Control</div>
       <h2 class="section-title reveal">Commands Reference</h2>
-      <p class="section-sub reveal">Everything you can do from Telegram. Supports per-chat workspace/session isolation via env config.</p>
+      <p class="section-sub reveal">Everything you can do from Telegram. Supports per-chat workspace/session isolation via env config, plus optional low-latency local voice transcription with faster-whisper.</p>
       <div class="cmd-grid">
 
         <div class="cmd-card reveal">
           <div class="cmd-label">AI Prompt</div>
           <div class="cmd-syntax">just type naturally</div>
-          <div class="cmd-desc">Any message is sent as a prompt to the AI agent on HPC.</div>
+          <div class="cmd-desc">Any text message is sent as a prompt to the AI agent on HPC. Voice/audio messages can also be received and, optionally, pre-transcribed locally with faster-whisper before reaching the agent.</div>
         </div>
 
         <div class="cmd-card reveal">
@@ -1159,6 +1159,12 @@
           <div class="cmd-label">Wildcard Fetch</div>
           <div class="cmd-syntax">/send Auto*.png</div>
           <div class="cmd-desc">Download all matching files. Supports glob patterns.</div>
+        </div>
+
+        <div class="cmd-card reveal">
+          <div class="cmd-label">Voice Note / Audio</div>
+          <div class="cmd-syntax">send a Telegram voice note</div>
+          <div class="cmd-desc">Receive Telegram voice/audio messages. For best latency, enable optional local <strong>faster-whisper</strong> transcription so the relay converts speech to text before passing it to the agent.</div>
         </div>
 
         <div class="cmd-card reveal">
@@ -1273,7 +1279,7 @@
             <h3>Clone, Configure, Run</h3>
             <p>Clone the repo, copy <code style="font-family:monospace">.env.example</code> to <code
                 style="font-family:monospace">.env</code>, fill in your values — that's all the config you need.</p>
-            <code>git clone https://github.com/MichaelG0501/hpc-relay.git&#10;cd hpc-relay&#10;&#10;# Create a separate Python environment (recommended)&#10;# python3 -m venv hpcrelay && source hpcrelay/bin/activate&#10;&#10;pip install -r requirements.txt&#10;cp .env.example .env&#10;&#10;# Edit .env with your values&#10;python relay_bot.py</code>
+            <code>git clone https://github.com/MichaelG0501/OpencodeClaw.git&#10;cd OpencodeClaw&#10;&#10;# Create a separate Python environment (recommended)&#10;# python3 -m venv OpencodeClaw && source OpencodeClaw/bin/activate&#10;&#10;pip install -r requirements.txt&#10;cp .env.example .env&#10;&#10;# Edit .env with your values&#10;python relay_bot.py</code>
           </div>
         </div>
 
@@ -1385,14 +1391,14 @@
         <h2>Ready to control your cluster?</h2>
         <p>Clone the repo, edit your config, and send your first command from Telegram.</p>
         <div class="actions">
-          <a href="https://github.com/MichaelG0501/hpc-relay" class="btn-primary" target="_blank">Star on GitHub</a>
+          <a href="https://github.com/MichaelG0501/OpencodeClaw" class="btn-primary" target="_blank">Star on GitHub</a>
         </div>
       </div>
     </div>
   </section>
 
   <footer>
-    <p>Built for researchers &middot; <a href="https://github.com/MichaelG0501/hpc-relay">GitHub</a> &middot; BSD-3
+    <p>Built for researchers &middot; <a href="https://github.com/MichaelG0501/OpencodeClaw">GitHub</a> &middot; BSD-3
       License</p>
   </footer>
 

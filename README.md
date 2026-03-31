@@ -1,6 +1,6 @@
 <div align="center">
 
-# HPC-Relay
+# OpencodeClaw
 
 ### Opencode AI agent on your phone - Access anywhere!
 
@@ -8,11 +8,11 @@
 [![Telegram Bot API](https://img.shields.io/badge/Telegram-Bot%20API-26A5E4?style=flat-square&logo=telegram)](https://core.telegram.org/bots/api)
 [![OpenCode](https://img.shields.io/badge/Agent-OpenCode%20%7C%20Claude%20Code-green?style=flat-square)](https://opencode.ai)
 [![License: BSD-3](https://img.shields.io/badge/License-BSD--3-yellow?style=flat-square)](LICENSE)
-[![Lint](https://github.com/MichaelG0501/hpc-relay/actions/workflows/lint.yml/badge.svg)](https://github.com/MichaelG0501/hpc-relay/actions)
+[![Lint](https://github.com/MichaelG0501/OpencodeClaw/actions/workflows/lint.yml/badge.svg)](https://github.com/MichaelG0501/OpencodeClaw/actions)
 
 **No VPN. No terminal. Just work on your phone.**
 
-[Website](https://michaelg0501.github.io/hpc-relay/) · [Quick Start](#quick-start) · [Commands Reference](#commands-reference) · [Model Support](#supported-models) · [File Transfers](#file-transfers) · [Chat Viewer](#chat-history-viewer)
+[Website](https://michaelg0501.github.io/OpencodeClaw/) · [Quick Start](#quick-start) · [Commands Reference](#commands-reference) · [Model Support](#supported-models) · [File Transfers](#file-transfers) · [Chat Viewer](#chat-history-viewer)
 
 </div>
 
@@ -32,13 +32,13 @@
 
 ---
 
-## Why HPC-Relay
+## Why OpencodeClaw
 
 You’re a researcher or developer. Your data and code live on an HPC cluster, your WSL setup, or your lab macOS machine — but you’re not always sitting at your workstation.
 
 Sometimes you’re travelling, commuting, or just away from your laptop. You still want to run a quick analysis, check results, or ask an AI agent to sanity-check something. Or you want AI agent to start planning and implementing a long analysis while you take a rest.
 
-**HPC-Relay lets you do that from your phone.**
+**OpencodeClaw lets you do that from your phone.**
 
 Just message your workstation or HPC through Telegram.
 
@@ -71,6 +71,7 @@ You authenticate **once**. Everything else is automatic.
 | **No VPN on phone** | Relay sits inside the authenticated network |
 | **AI session memory** | Parses & re-injects `sessionID` -- full context from cold start |
 | **File transfer** | Download files from the target machine to Telegram (`/send <path>`) |
+| **Voice notes / audio** | Telegram voice notes can be received and processed; optional local `faster-whisper` pre-transcription for low-latency speech-to-text |
 | **File upload** | Upload files from target to cloud (`/upload <path>`) |
 | **Wildcard fetch** | Send multiple files with glob patterns (e.g. `/send Auto*.png`) |
 | **Chat history viewer** | Generate interactive HTML viewer of all AI conversations |
@@ -104,6 +105,7 @@ Generate an expression heatmap with random synthetic data.
 | `/send Auto*.png` | Download matching files (wildcard) | `/send /project/Auto*.png` |
 | `/upload <path>` | Upload a file from target machine to cloud | `/upload ~/data/input.csv` |
 | `/scheduled` | Open scheduled tasks manager (edit/delete interactively) | `/scheduled` |
+| voice / audio / video note | Upload from Telegram and analyze with the agent; for best latency, enable optional local `faster-whisper` transcription | send a voice note |
 
 ### Shell Commands
 
@@ -223,11 +225,11 @@ curl -fsSL https://opencode.ai/install | bash
 ### Step 4 -- Configure and Run
 
 ```bash
-git clone https://github.com/MichaelG0501/hpc-relay.git
-cd hpc-relay
+git clone https://github.com/MichaelG0501/OpencodeClaw.git
+cd OpencodeClaw
 
 # Create a separate Python environment (recommended)
-# python3 -m venv hpcrelay && source hpcrelay/bin/activate
+# python3 -m venv ~/.venvs/OpencodeClaw && source ~/.venvs/OpencodeClaw/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
 ```
@@ -261,6 +263,32 @@ Generate an expression heatmap with random data.
 ```
 
 The AI executes on the target machine and streams the response back -- formatted, chunked, and readable.
+
+### Optional: Fast local speech-to-text (recommended)
+
+Telegram voice notes usually arrive as **OGG/Opus**. OpencodeClaw can forward audio directly to the agent, but this is often slower than pre-transcribing locally.
+
+For lower latency, install **ffmpeg** + **faster-whisper** and let the relay transcribe pure voice/audio messages first, then send the transcript to the agent.
+
+Recommended local setup (on the relay machine):
+
+```bash
+sudo apt-get update
+sudo apt-get install -y ffmpeg python3-pip
+~/local_relay/OpencodeClaw/bin/python -m pip install --upgrade pip setuptools wheel
+~/local_relay/OpencodeClaw/bin/python -m pip install faster-whisper
+```
+
+The first model download (for example `small`) is stored in the user cache, typically under:
+
+```bash
+~/.cache/huggingface/hub/models--Systran--faster-whisper-small
+```
+
+Notes:
+- **Python package** lives in your shared relay venv (recommended: `~/.venvs/OpencodeClaw`)
+- **Model weights** live in the user cache, not inside the venv itself
+- If local Whisper is not installed, the relay can still fall back to agent-side audio analysis (slower)
 
 ---
 
@@ -296,7 +324,7 @@ python3 tools/chat_viewer.py
 
 ## Supported Models
 
-HPC-Relay works with [OpenCode](https://opencode.ai), which routes to every major AI provider. You can also swap in **Claude Code**, **Aider**, or any headless CLI agent.
+OpencodeClaw works with [OpenCode](https://opencode.ai), which routes to every major AI provider. You can also swap in **Claude Code**, **Aider**, or any headless CLI agent.
 
 | Provider | Models | Notes |
 |---|---|---|
@@ -312,7 +340,7 @@ HPC-Relay works with [OpenCode](https://opencode.ai), which routes to every majo
 
 ## HPC Best Practices
 
-Many HPC clusters **prohibit heavy computation on login nodes**. HPC-Relay is designed with this in mind:
+Many HPC clusters **prohibit heavy computation on login nodes**. OpencodeClaw is designed with this in mind:
 
 ### Recommended Workflow
 
@@ -345,7 +373,7 @@ Then:
 | `rclone sync` (lightweight) | Multi-core jobs |
 | AI agent (ephemeral, short-lived) | Long-running processes |
 
-> HPC-Relay's daemonless architecture means the AI agent spins up, answers, and terminates -- no idle processes consuming shared resources.
+> OpencodeClaw's daemonless architecture means the AI agent spins up, answers, and terminates -- no idle processes consuming shared resources.
 
 ---
 
@@ -371,7 +399,7 @@ rclone sync ~/results gdrive:HPC-Results/
 
 ### Why Not tmux Screen-Scraping?
 
-| Problem | HPC-Relay Solution |
+| Problem | OpencodeClaw Solution |
 |---|---|
 | ANSI escape codes pollute output | `--format json` -- structured, parseable |
 | Async timing -- don't know when AI finishes | JSON event stream with explicit completion |
@@ -434,7 +462,7 @@ Use `/scheduled` for all scheduled task management.
 
 ### Workspace Separation (multi-chat isolation)
 
-HPC-Relay can isolate sessions/tasks/workdir per chat. Configure with env:
+OpencodeClaw can isolate sessions/tasks/workdir per chat. Configure with env:
 
 ```bash
 CHANNEL_WORKSPACES={"8670800334":{"name":"mg","workdir":"~/workspace_mg","allowed_users":[8670800334]}}

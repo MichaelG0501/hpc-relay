@@ -1,10 +1,10 @@
-# Contributing to HPC-Relay
+# Contributing to OpencodeClaw
 
 Thanks for your interest in contributing! This guide covers the basics.
 
 ## Reporting Issues
 
-- Search [existing issues](https://github.com/MichaelG0501/hpc-relay/issues) first
+- Search [existing issues](https://github.com/MichaelG0501/OpencodeClaw/issues) first
 - Include your Python version, OS, and relay log output
 - For security issues, **do not** open a public issue -- email the maintainer directly
 
